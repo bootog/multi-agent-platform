@@ -1,4 +1,5 @@
-from typing import Any
+from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
@@ -51,6 +52,52 @@ class ChatTurnStarted(CamelModel):
     session_id: str
     # True when the given session no longer existed and a new one was started.
     session_restarted: bool = False
+
+
+# --- Chat history ------------------------------------------------------------
+# Response bodies never carry top-level "message"/"status"/"failed" keys: the host's
+# AuthInterceptor turns those into toasts.
+
+
+class ChatSessionRequest(CamelModel):
+    agent_key: str | None = Field(None, pattern=AGENT_KEY_PATTERN)
+
+
+class ChatSessionCreated(CamelModel):
+    session_id: str
+    created_at: datetime
+
+
+class ChatHistorySession(CamelModel):
+    session_id: str
+    title: str
+    created_at: datetime
+    updated_at: datetime
+    message_count: int
+
+
+class ChatHistoryMessage(CamelModel):
+    id: int
+    role: Literal["user", "assistant"]
+    content: str
+    # The `result` of the turn's final run event (cards the UI showed with the reply).
+    result: dict[str, Any] | None = None
+    error: bool = False
+    created_at: datetime
+
+
+class ChatHistoryDetail(ChatHistorySession):
+    messages: list[ChatHistoryMessage]
+
+
+class DeleteHistoryRequest(CamelModel):
+    session_ids: list[str] = Field(..., min_length=1, max_length=100)
+    agent_key: str | None = Field(None, pattern=AGENT_KEY_PATTERN)
+
+
+class DeleteHistoryResult(CamelModel):
+    deleted_session_ids: list[str]
+    deleted_count: int
 
 
 class ProviderOut(CamelModel):

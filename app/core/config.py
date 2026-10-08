@@ -38,6 +38,14 @@ class Settings:
     openai_timeout_seconds: float = 30.0
     openai_realtime_model: str | None = None
 
+    # PostgreSQL server of the agent chat-history database (AGENT_DB_NAME). This is a
+    # dedicated database owned by the agent platform; it is created on startup if missing.
+    db_host: str = "localhost"
+    db_port: int = 5432
+    db_user: str | None = None
+    db_password: str | None = field(default=None, repr=False)
+    agent_db_name: str | None = None
+
 
 @lru_cache
 def get_settings() -> Settings:
@@ -52,4 +60,9 @@ def get_settings() -> Settings:
         openai_temperature=_float_or_none(os.getenv("OPENAI_TEMPERATURE", "0.2")),
         openai_timeout_seconds=float(os.getenv("OPENAI_TIMEOUT_SECONDS", "30")),
         openai_realtime_model=os.getenv("OPENAI_REALTIME_MODEL") or None,
+        db_host=os.getenv("DB_HOST") or "localhost",
+        db_port=int(os.getenv("DB_PORT") or "5432"),
+        db_user=os.getenv("DB_USER") or None,
+        db_password=os.getenv("DB_PASSWORD") or None,
+        agent_db_name=(os.getenv("AGENT_DB_NAME") or "").strip() or None,
     )

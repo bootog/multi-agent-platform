@@ -6,6 +6,7 @@ from fastapi.responses import StreamingResponse
 
 from app.agents.contact_us import plan_for, run_contact_us_agent
 from app.agents.contact_us.agent_graph import owner_fingerprint, sessions, start_turn_task
+from app.agents.contact_us.history import canonical_session_id, record_turn, restore_session
 from app.agents.contact_us.modules import canonical_agent_key
 from app.agents.contact_us.schemas import ChatTurnRequest, ChatTurnStarted, ContactUsRunRequest, ProviderOut, RunStarted
 from app.agents.runtime import registry
@@ -76,9 +77,12 @@ async def send_contact_us_chat_message(
     auth = _auth(authorization, x_tenant_id, x_role_id, x_device_id)
     owner = owner_fingerprint(auth.bearer_token)
     agent = canonical_agent_key(request.agent_key)
-    session_id, restarted = request.session_id, False
+    session_id, restarted = canonical_session_id(request.session_id), False
     if session_id and sessions.owner_of(session_id) is None:
-        session_id, restarted = None, True
+        # Not live (restart/expiry/reopened from history): continue it from chat history
+        # under the same id when it is this caller's conversation with this agent.
+        if not await restore_session(session_id, owner, agent):
+            session_id, restarted = None, True
     if session_id is None:
         session_id = await sessions.create(owner, agent)
     elif sessions.owner_of(session_id) != owner:
@@ -92,9 +96,9 @@ async def send_contact_us_chat_message(
 
     message = (request.message or "").strip() or None
     channel = registry.create("contact-us")
-    registry.track(
-        start_turn_task(channel, session_id, message, BootogClient(auth), request.agent_key, request.agent_label)
-    )
+    turn = start_turn_task(channel, session_id, message, BootogClient(auth), request.agent_key, request.agent_label)
+    registry.track(turn)
+    registry.track(record_turn(turn, channel, session_id, owner, agent, message))
     return ChatTurnStarted(run_id=channel.run_id, session_id=session_id, session_restarted=restarted)
 
 

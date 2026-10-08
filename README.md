@@ -29,6 +29,27 @@ py -m venv .venv
 | `OPENAI_TEMPERATURE` | `0.2` | Empty = model default (needed for reasoning models) |
 | `OPENAI_TIMEOUT_SECONDS` | `30` | Per LLM call |
 | `OPENAI_REALTIME_MODEL` | – | Reserved for realtime/voice features; not used for chat reasoning |
+| `DB_HOST` / `DB_PORT` | `localhost` / `5432` | PostgreSQL server of the agent chat-history database |
+| `DB_USER` / `DB_PASSWORD` | – | PostgreSQL login (needs CREATEDB only if `AGENT_DB_NAME` doesn't exist yet) |
+| `AGENT_DB_NAME` | – | Dedicated chat-history database (e.g. `AgentDB`), created with its tables on startup if missing. Never the core app database |
+
+### Chat history (`app/history/store.py`)
+
+One database (`AGENT_DB_NAME`), two tables: `contact_agent_sessions` (one row per
+conversation, keyed by the chat `session_id`) and `contact_agent_messages` (FK, `ON DELETE
+CASCADE`). Everything is scoped to the caller (JWT-subject fingerprint) and the Contact agent.
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/agents/contact-us/session` | New Chat: new session id |
+| `GET /api/v1/agents/contact-us/history?agentKey=` | Stored conversations, newest first |
+| `GET /api/v1/agents/contact-us/history/{sessionId}?agentKey=` | One conversation's messages |
+| `DELETE /api/v1/agents/contact-us/history` `{sessionIds, agentKey}` | Permanently delete selected conversations |
+
+`POST /contact-us/chat` records each turn (user message, then the agent's reply). A session id
+that is no longer live (restart, idle expiry) but is in the caller's history is continued under
+the same id, and its messages seed the LangGraph thread as conversational context. If PostgreSQL
+is unreachable, chat works as before and the history endpoints return 503.
 
 `.env` in the project root is loaded at startup; real environment variables win.
 

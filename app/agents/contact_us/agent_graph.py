@@ -190,6 +190,13 @@ class ChatSessions:
         self._last_used[session_id] = time.monotonic()
         return session_id
 
+    async def restore(self, session_id: str, owner: str, agent: str) -> None:
+        """Re-registers a conversation reopened from chat history under its own id."""
+        await self._prune()
+        self._owners[session_id] = owner
+        self._agents[session_id] = agent
+        self._last_used[session_id] = time.monotonic()
+
     def owner_of(self, session_id: str) -> str | None:
         return self._owners.get(session_id)
 
