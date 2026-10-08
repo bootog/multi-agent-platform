@@ -24,6 +24,13 @@ py -m venv .venv
 | `BOOTOG_TIMEOUT_SECONDS` | `20` | Per-request timeout |
 | `CONTACT_US_PAGE_SIZE` | `50` | Contact Us requests read per run (newest first) |
 | `ALLOWED_ORIGINS` | `http://localhost:4201` | CORS origins (comma-separated) |
+| `OPENAI_API_KEY` | – | Required for the chat agent. Never logged or sent to the browser |
+| `OPENAI_CHAT_MODEL` | `gpt-4.1-mini` | Model for LangGraph text reasoning (understanding, extraction, replies) |
+| `OPENAI_TEMPERATURE` | `0.2` | Empty = model default (needed for reasoning models) |
+| `OPENAI_TIMEOUT_SECONDS` | `30` | Per LLM call |
+| `OPENAI_REALTIME_MODEL` | – | Reserved for realtime/voice features; not used for chat reasoning |
+
+`.env` in the project root is loaded at startup; real environment variables win.
 
 Auth: the caller's `Authorization: Bearer …`, `X-Tenant-Id` and `X-Role-Id` headers
 are forwarded to Bootog, so the agent acts with the signed-in user's access. Tokens
@@ -48,10 +55,50 @@ app/
       tools.py                   LangChain tools over the Bootog APIs
       nodes.py                   graph nodes; each emits running/completed/failed/blocked
       graph.py                   the LangGraph workflow + run executor
+      understanding.py           LLM decision layer (typed interpretation, replies)
+      agent_nodes.py             chat nodes around the existing ones; activity emitter
+      agent_graph.py             chat state machine, sessions, turn executor
+  llm/openapi.py                 get_llm(): the shared chat model
+  prompts/contact_us.py          chat agent prompts
   api/routes/contact_us.py       HTTP endpoints
 ```
 
-## Contact Us Agent
+## Contact Us Agent — chat
+
+The Contact Us page is a chat workspace. Each user message is one LangGraph turn over
+a checkpointed session (`agents/contact_us/agent_graph.py`):
+
+```
+start_turn → understand_message (LLM) → [resolve_provider] → [get_contact_us_data]
+  → [match_request] → [select_contact_request → prepare_customer_data]
+  → [merge_customer_fields] → [validate_customer_data]
+       ├─ missing/invalid → ask_for_missing  (turn ends, waiting for the user)
+       └─ complete → create_customer → verify_customer
+  → respond (LLM) → END
+```
+
+- **LLM** (`understanding.py`, prompts in `app/prompts/contact_us.py`): turns the message
+  into a typed `TurnUnderstanding` (intent, goal, request reference, date/company
+  filters, customer field values, extra notes) and writes the reply from structured facts.
+- **Router** (`next_step`): deterministic; decides the next node from that interpretation
+  plus state. The LLM never chooses or builds an API call.
+- **Nodes**: the existing workflow nodes do all Bootog work unchanged.
+- **Memory**: selected request, user-supplied fields (latest value wins, empty values
+  ignored), extra notes and history persist per session. Extra notes are never sent to
+  Bootog; the customer payload only ever has `CUSTOMER_FIELDS` keys.
+- **Sessions** live in memory (`InMemorySaver`); swap for a persistent LangGraph saver to
+  survive restarts. A session belongs to the caller that created it (JWT `sub`).
+
+| Endpoint | |
+|---|---|
+| `POST /api/v1/agents/contact-us/chat` | `{sessionId?, message?}` → `{runId, sessionId, sessionRestarted}` (202). No message = "Run Agent" (start the session and load the latest requests) |
+| `DELETE /api/v1/agents/contact-us/chat/{sessionId}` | Clear the conversation |
+| `GET /api/v1/agents/runs/{runId}/events` | SSE: `step` events (with `title`, `activityId`; status `running/completed/failed/blocked/waiting`) and a final `run` event whose `result` holds the reply, workflow status, request cards and customer data |
+
+Tests: `pytest` runs everything offline (scripted LLM, mocked Bootog). With
+`RUN_LLM_TESTS=1` it also runs full conversations against the real chat model.
+
+## Contact Us Agent — run workflow
 
 ```
 initialize_run → select_provider → get_contact_us_data ─┬─ (no request selected) → END
