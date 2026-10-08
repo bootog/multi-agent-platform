@@ -41,13 +41,14 @@ class StepBlocked(Exception):
 NodeFn = Callable[[ContactUsAgentState, RunnableConfig], Awaitable[StepResult]]
 
 
-def tracked_step(step_id: str, running_message: str, failure_message: str):
+def tracked_step(step_id: str, running_message: str | Callable[[ContactUsAgentState], str], failure_message: str):
     def decorator(fn: NodeFn):
         @functools.wraps(fn)
         async def node(state: ContactUsAgentState, config: RunnableConfig) -> dict[str, Any]:
             emitter: RunEmitter = config["configurable"]["emitter"]
             run_id = state["run_id"]
-            await emitter.step(step_id, "running", running_message)
+            message = running_message(state) if callable(running_message) else running_message
+            await emitter.step(step_id, "running", message)
             log_step(logger, AGENT, run_id, step_id, "running")
             started = time.perf_counter()
 
@@ -108,14 +109,36 @@ async def select_provider(state: ContactUsAgentState, config: RunnableConfig) ->
     return StepResult(f"Using {match['providerName']}", {"provider_name": match["providerName"]})
 
 
-@tracked_step("get_contact_us_data", "Pulling Contact Us requests", "Unable to retrieve Contact Us requests.")
+def _request_noun(state: ContactUsAgentState) -> str:
+    """"Contact Us request" for the run workflow; the chat agent's own kind otherwise."""
+    return (state.get("agent_name") or "Contact Us Agent").removesuffix(" Agent") + " request"
+
+
+@tracked_step(
+    "get_contact_us_data",
+    lambda state: f"Pulling {_request_noun(state)}s",
+    "Unable to retrieve Contact Us requests.",
+)
 async def get_contact_us_data(state: ContactUsAgentState, config: RunnableConfig) -> StepResult:
-    page = await get_contact_us_requests.ainvoke({"provider_id": state.get("provider_id")}, config=config)
+    # `request_filters` / `module_filter` are only set by the chat agent; the run workflow
+    # never sets them, so it keeps the documented Contact-Us filter.
+    filters = state.get("request_filters") or {}
+    page = await get_contact_us_requests.ainvoke(
+        {
+            "provider_id": state.get("provider_id"),
+            "contact_name": filters.get("contact_name"),
+            "created_from": filters.get("created_from"),
+            "created_to": filters.get("created_to"),
+            "module_filter": state.get("module_filter"),
+        },
+        config=config,
+    )
     records, total = page["records"], page["total"]
+    noun = _request_noun(state)
     if len(records) == total:
-        message = f"Retrieved {total} Contact Us request{'s' if total != 1 else ''}"
+        message = f"Retrieved {total} {noun}{'s' if total != 1 else ''}"
     else:
-        message = f"Retrieved the latest {len(records)} of {total} Contact Us requests"
+        message = f"Retrieved the latest {len(records)} of {total} {noun}s"
     return StepResult(
         message,
         {"contact_requests": records, "contact_requests_total": total},

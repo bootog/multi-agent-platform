@@ -26,11 +26,24 @@ async def get_provider_list(config: RunnableConfig) -> list[dict[str, str]]:
 
 
 @tool
-async def get_contact_us_requests(config: RunnableConfig, provider_id: str | None = None) -> dict[str, Any]:
-    """Retrieve open Contact Us requests, newest first, optionally narrowed to one provider."""
+async def get_contact_us_requests(
+    config: RunnableConfig,
+    provider_id: str | None = None,
+    contact_name: str | None = None,
+    created_from: str | None = None,
+    created_to: str | None = None,
+    module_filter: str | None = None,
+) -> dict[str, Any]:
+    """Retrieve open Contact Us requests, newest first, optionally narrowed to one provider,
+    a contact name and/or a created-date range (YYYY-MM-DD). `module_filter` scopes the
+    records to one Contact module (default: Contact-Us)."""
     page = await ContactUsApi(_client(config)).list_requests(
         provider_id=provider_id,
         page_size=get_settings().contact_us_page_size,
+        contact_name=contact_name,
+        created_from=created_from,
+        created_to=created_to,
+        module_filter=module_filter,
     )
     return {"total": page.total, "records": page.records}
 

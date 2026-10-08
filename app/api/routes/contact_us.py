@@ -1,11 +1,13 @@
 import asyncio
 import json
 
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, Response, status
 from fastapi.responses import StreamingResponse
 
 from app.agents.contact_us import plan_for, run_contact_us_agent
-from app.agents.contact_us.schemas import ContactUsRunRequest, ProviderOut, RunStarted
+from app.agents.contact_us.agent_graph import owner_fingerprint, sessions, start_turn_task
+from app.agents.contact_us.modules import canonical_agent_key
+from app.agents.contact_us.schemas import ChatTurnRequest, ChatTurnStarted, ContactUsRunRequest, ProviderOut, RunStarted
 from app.agents.runtime import registry
 from app.integrations.bootog import BootogApiError, BootogAuth, BootogClient, ProviderApi
 
@@ -55,6 +57,55 @@ async def start_contact_us_run(
     registry.track(asyncio.create_task(run_contact_us_agent(channel, request, client)))
     mode = "create_customer" if request.contact_request_id else "retrieve"
     return RunStarted(run_id=channel.run_id, mode=mode, steps=plan_for(mode))
+
+
+@router.post(
+    "/contact-us/chat",
+    response_model=ChatTurnStarted,
+    response_model_by_alias=True,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def send_contact_us_chat_message(
+    request: ChatTurnRequest,
+    authorization: str | None = Header(None),
+    x_tenant_id: str | None = Header(None),
+    x_role_id: str | None = Header(None),
+    x_device_id: str | None = Header(None),
+) -> ChatTurnStarted:
+    """One chat turn. Follow its activity and final reply on GET /runs/{runId}/events."""
+    auth = _auth(authorization, x_tenant_id, x_role_id, x_device_id)
+    owner = owner_fingerprint(auth.bearer_token)
+    agent = canonical_agent_key(request.agent_key)
+    session_id, restarted = request.session_id, False
+    if session_id and sessions.owner_of(session_id) is None:
+        session_id, restarted = None, True
+    if session_id is None:
+        session_id = await sessions.create(owner, agent)
+    elif sessions.owner_of(session_id) != owner:
+        # 403, not 401: the host's AuthInterceptor opens a login popup on any 401.
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="This conversation belongs to another user.")
+    elif sessions.agent_of(session_id) != agent:
+        # Never let one agent's messages land in another agent's conversation.
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="This conversation belongs to another agent.")
+    if not sessions.begin(session_id):
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="The agent is still working on your previous message.")
+
+    message = (request.message or "").strip() or None
+    channel = registry.create("contact-us")
+    registry.track(
+        start_turn_task(channel, session_id, message, BootogClient(auth), request.agent_key, request.agent_label)
+    )
+    return ChatTurnStarted(run_id=channel.run_id, session_id=session_id, session_restarted=restarted)
+
+
+@router.delete("/contact-us/chat/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def clear_contact_us_chat(session_id: str, authorization: str | None = Header(None)) -> Response:
+    owner = sessions.owner_of(session_id)
+    if owner is not None:
+        if owner != owner_fingerprint(_auth(authorization, None, None, None).bearer_token):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail="This conversation belongs to another user.")
+        await sessions.delete(session_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/runs/{run_id}/events")

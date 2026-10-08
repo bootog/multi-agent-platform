@@ -1,4 +1,4 @@
-from typing import Any, Literal, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
 RunMode = Literal["retrieve", "create_customer"]
 ExecutionStatus = Literal["running", "completed", "blocked", "failed"]
@@ -26,3 +26,68 @@ class ContactUsAgentState(TypedDict, total=False):
     error: str | None
     started_at: str
     finished_at: str
+
+
+# --- Chat agent ------------------------------------------------------------
+# One LangGraph thread per chat session (checkpointed), one graph invocation per
+# user message. Fields above keep their meaning, so the existing nodes run
+# unchanged inside the chat graph:
+#   contact_request_id / contact_request  -> the selected request (id / record)
+#   customer_payload                      -> customer data; only CUSTOMER_FIELDS keys
+#   missing_required_fields               -> labels still required
+
+WorkflowStatus = Literal["ready", "running", "waiting_for_user", "completed", "blocked", "failed"]
+
+_HISTORY_LIMIT = 40
+
+
+class ChatMessage(TypedDict):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+def append_history(existing: list[ChatMessage] | None, new: list[ChatMessage] | None) -> list[ChatMessage]:
+    return ((existing or []) + (new or []))[-_HISTORY_LIMIT:]
+
+
+class ContactUsChatState(ContactUsAgentState, total=False):
+    session_id: str
+    # Which Contact agent this session belongs to (Contact menu route segment) and the
+    # GET /ContactUs module clause it works on. Fixed for the life of the session.
+    agent_key: str
+    agent_name: str
+    module_filter: str
+    # Fingerprint of the caller that owns the session; turns from anyone else are refused.
+    owner: str
+    conversation_history: Annotated[list[ChatMessage], append_history]
+
+    # Set per turn
+    current_user_message: str | None
+    kickoff: bool  # "Run Agent": start the session without a user message
+    intent: str | None
+    request_summary: str | None  # neutral one-line label of what the user asked
+    request_reference: dict[str, Any] | None
+    request_filters: dict[str, Any] | None
+    company_name: str | None
+    turn_steps: list[str]  # nodes executed this turn (loop guard for routing)
+    match_result: dict[str, Any] | None
+    turn_field_updates: dict[str, str]  # customer fields stated in this message
+    turn_extra_information: dict[str, str]
+    tool_errors: list[str]
+    last_tool_result: dict[str, Any] | None
+    agent_response: str | None
+    completed_steps: list[str]
+    failed_steps: list[str]
+
+    # Kept across turns
+    operation: str | None  # ongoing workflow goal, e.g. "create_customer"
+    listed_request_ids: list[str]  # order of the requests last shown to the user
+    user_customer_fields: dict[str, str]  # values the user supplied (latest wins)
+    known_fields: list[str]
+    invalid_fields: dict[str, str]
+    extra_information: dict[str, str]  # useful info outside the API schema; never sent
+    pending_question: dict[str, Any] | None
+    awaiting_user_input: bool
+    created_customers: dict[str, str]  # request id -> customer id; never create twice
+    workflow_status: WorkflowStatus
+    is_complete: bool
