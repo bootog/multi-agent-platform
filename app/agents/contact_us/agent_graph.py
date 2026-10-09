@@ -6,17 +6,24 @@ from the user; the next message continues from the same saved state.
 
     START -> start_turn -> understand_message (LLM)
           -> [resolve_provider]                       company named in chat
-          -> [get_contact_us_data]                    existing node
+          -> [search_providers]                       "find/list service providers"
+          -> [resolve_assigned_user]                  "assigned to X"
+          -> [get_contact_us_data]                    existing node (list / search all pages)
           -> [match_request]                          which request the user means
           -> [select_contact_request -> prepare_customer_data]   existing nodes
           -> [merge_customer_fields]                  values the user supplied
-          -> [validate_customer_data]
-               ├─ missing/invalid -> ask_for_missing  (turn waits for the user)
-               └─ complete -> create_customer -> verify_customer  existing nodes
+          -> conversion (Customer / B2B Client / Partner):
+               start_conversion -> [choose_conversion_type] -> [resolve_target_provider]
+               -> validate_customer_data ── missing/invalid -> ask_for_missing (waits)
+               -> check_existing_account -> resolve_role -> [select_subcategories]
+               -> confirm_conversion (waits for an explicit "yes")
+               -> create_account -> verify_account -> [link_provider_vendor]
+               -> [save_subcategories] -> update_request_status -> refresh_requests
           -> respond (LLM, from structured facts) -> END
 
 `next_step` runs after every node and decides where to go from the LLM's
-interpretation plus the structured state. The LLM never chooses an API call."""
+interpretation plus the structured state. The LLM never chooses an API call, and
+nothing is created without a confirmation of exactly the data that is sent."""
 
 import asyncio
 import base64
@@ -31,17 +38,20 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from app.agents.contact_us import agent_nodes, nodes
+from app.agents.contact_us import agent_nodes, conversion_nodes, nodes
 from app.agents.contact_us.agent_nodes import (
+    REFERENCE_KEYS,
     ChatEmitter,
     customer_view,
     listed_records,
     listed_this_turn,
     request_summary,
 )
+from app.agents.contact_us.conversion_nodes import active_type, conversion_fingerprint, conversion_of
+from app.agents.contact_us.conversions import CONVERSION_OPERATIONS
 from app.agents.contact_us.modules import agent_name, canonical_agent_key, module_filter
 from app.agents.contact_us.state import ContactUsChatState
-from app.agents.contact_us.understanding import REQUEST_INTENTS, WORKFLOW_INTENTS
+from app.agents.contact_us.understanding import ADVANCING_INTENTS, CONVERSION_INTENTS, REQUEST_INTENTS, WORKFLOW_INTENTS
 from app.agents.runtime import RunChannel
 from app.core.logging import get_logger
 from app.integrations.bootog import BootogClient
@@ -53,15 +63,28 @@ NodeFn = Callable[[ContactUsChatState, RunnableConfig], Awaitable[dict[str, Any]
 NODES: dict[str, NodeFn] = {
     "understand_message": agent_nodes.understand_message,
     "resolve_provider": agent_nodes.resolve_provider,
+    "search_providers": conversion_nodes.search_providers,
+    "resolve_assigned_user": conversion_nodes.resolve_assigned_user,
     "get_contact_us_data": nodes.get_contact_us_data,
     "match_request": agent_nodes.match_request,
     "select_contact_request": nodes.select_contact_request,
     "prepare_customer_data": nodes.prepare_customer_data,
     "merge_customer_fields": agent_nodes.merge_customer_fields,
+    "start_conversion": conversion_nodes.start_conversion,
+    "choose_conversion_type": conversion_nodes.choose_conversion_type,
+    "resolve_target_provider": conversion_nodes.resolve_target_provider,
     "validate_customer_data": agent_nodes.validate_customer_data,
     "ask_for_missing": agent_nodes.ask_for_missing,
-    "create_customer": nodes.create_customer_node,
-    "verify_customer": nodes.verify_customer,
+    "check_existing_account": conversion_nodes.check_existing_account,
+    "resolve_role": conversion_nodes.resolve_role,
+    "select_subcategories": conversion_nodes.select_subcategories,
+    "confirm_conversion": conversion_nodes.confirm_conversion,
+    "create_account": conversion_nodes.create_account,
+    "verify_account": conversion_nodes.verify_account,
+    "link_provider_vendor": conversion_nodes.link_provider_vendor,
+    "save_subcategories": conversion_nodes.save_subcategories,
+    "update_request_status": conversion_nodes.update_request_status,
+    "refresh_requests": conversion_nodes.refresh_requests,
 }
 
 
@@ -88,25 +111,33 @@ def next_step(state: ContactUsChatState) -> str:
         return "resolve_provider"
 
     intent = state.get("intent")
+    if intent == "list_providers":
+        return "search_providers" if not ran("search_providers") else "respond"
     if intent == "list_requests":
+        filters = state.get("request_filters") or {}
+        if filters.get("assigned_user_name"):
+            if not ran("resolve_assigned_user"):
+                return "resolve_assigned_user"
+            if not filters.get("assigned_user_ids"):
+                return "respond"  # unknown assignee: ask, never list everyone instead
         return "get_contact_us_data" if not ran("get_contact_us_data") else "respond"
     if intent not in WORKFLOW_INTENTS:
         return "respond"
 
-    creating = state.get("operation") == "create_customer"
+    converting = state.get("operation") in CONVERSION_OPERATIONS
     ref = state.get("request_reference") or {}
-    identifying = any(ref.get(k) for k in ("name", "email", "request_id", "position"))
+    identifying = any(ref.get(k) for k in REFERENCE_KEYS)
     match = state.get("match_result") or {}
 
     # Which request? Retrieve first if nothing suitable is loaded.
-    if identifying or (not state.get("contact_request") and (intent in REQUEST_INTENTS or creating)):
+    if identifying or (not state.get("contact_request") and (intent in REQUEST_INTENTS or converting)):
         if identifying and not ran("get_contact_us_data") and (
             not state.get("contact_requests") or state.get("request_filters")
         ):
             return "get_contact_us_data"
         if not ran("match_request"):
             return "match_request"
-        if match.get("status") == "search":  # name not loaded: search Bootog, then match again
+        if match.get("status") == "search":  # not loaded: search Bootog, then match again
             return "get_contact_us_data" if done[-1] == "match_request" else "match_request"
         if match.get("status") != "matched":
             # Ambiguous / not found / no reference: ask the user, keeping any details
@@ -117,7 +148,7 @@ def next_step(state: ContactUsChatState) -> str:
     if wanted and (state.get("contact_request") or {}).get("id") != wanted and not ran("select_contact_request"):
         return "select_contact_request"
     if (
-        creating
+        converting
         and state.get("contact_request")
         and not ran("prepare_customer_data")
         and (ran("select_contact_request") or not state.get("customer_payload"))
@@ -126,20 +157,91 @@ def next_step(state: ContactUsChatState) -> str:
     if _unmerged(state, ran):
         return "merge_customer_fields"
 
-    # Customer creation only advances when the user is working on it this turn.
-    if not (creating and state.get("contact_request") and intent in ("create_customer", "provide_information")):
+    # A conversion only advances when the user is working on it this turn.
+    if not (converting and state.get("contact_request") and intent in ADVANCING_INTENTS):
         return "respond"
+    return _conversion_step(state, ran)
+
+
+def _conversion_step(state: ContactUsChatState, ran: Callable[[str], int]) -> str:
+    if not ran("start_conversion"):
+        return "start_conversion"
+    conv = conversion_of(state)
+    if conv.get("blocked"):
+        return "respond"
+    ctype = active_type(state)
+    intent = state.get("intent")
+    completed = conv.get("completed") or []
+
+    if "create_account" in completed:
+        # The account exists: only resume the remaining steps, never create again.
+        if intent not in ("retry_operation", "confirm_action", *CONVERSION_INTENTS):
+            return "respond"
+        for step in ctype.steps():
+            if step not in completed:
+                return step if not ran(step) else "respond"
+        if ran("update_request_status") and not ran("refresh_requests"):
+            return "refresh_requests"
+        return "respond"
+
+    if ctype is None:
+        return "choose_conversion_type" if not ran("choose_conversion_type") else "respond"
+    turn = state.get("turn_conversion") or {}
+    answered_provider = (state.get("answered_question") or {}).get("type") == "choose_provider" and turn.get("option_position")
+    if ctype.needs_target_provider and (
+        not conv.get("target_provider")
+        or turn.get("target_provider_name")
+        or conv.get("pending_provider_name")
+        or answered_provider
+    ):
+        if not ran("resolve_target_provider"):
+            return "resolve_target_provider"
+        if not conv.get("target_provider"):
+            return "respond"
     if not ran("validate_customer_data"):
         return "validate_customer_data"
     if state.get("missing_required_fields") or state.get("invalid_fields"):
         return "ask_for_missing" if not ran("ask_for_missing") else "respond"
-    if (state.get("created_customers") or {}).get(state["contact_request"].get("id")):
-        return "respond"  # never create the same customer twice
-    if not ran("create_customer"):
-        return "create_customer"
-    if not ran("verify_customer"):
-        return "verify_customer"
-    return "respond"
+    if not ran("check_existing_account"):
+        # Every advancing turn: the email may have changed, or an earlier attempt's
+        # account may have appeared (then it is adopted, never created again).
+        return "check_existing_account"
+    if not conv.get("role_id"):
+        return "resolve_role" if not ran("resolve_role") else "respond"
+    if ctype.needs_subcategories:
+        wants_more = (
+            turn.get("subcategory_names")
+            or conv.get("pending_subcategory_names")
+            or (
+                (state.get("answered_question") or {}).get("type") == "choose_subcategory"
+                and (turn.get("option_position") or turn.get("option_positions"))
+            )
+        )
+        if (not conv.get("subcategories") or wants_more) and not ran("select_subcategories"):
+            return "select_subcategories"
+        if not conv.get("subcategories") or (state.get("pending_question") or {}).get("type") == "choose_subcategory":
+            return "respond"
+
+    current = conversion_fingerprint(state)
+    failed = conv.get("failed") or {}
+    if failed.get("step") == "create_account" and failed.get("kind") == "rejected" and failed.get("fingerprint") == current:
+        # Bootog rejected exactly these details: resending them can only fail again (or
+        # hit a half-created account). The user has to change something or cancel.
+        return "respond"
+    # Approval must answer a confirmation the user has SEEN: the question was pending
+    # before this message (or this is a retry of a failed creation), it was not asked in
+    # this same turn, and nothing changed since. A message misread as "yes" while it
+    # answers another question can never create an account.
+    answered_confirmation = (state.get("answered_question") or {}).get("type") == "confirm_conversion"
+    retrying_creation = intent == "retry_operation" and failed.get("step") == "create_account"
+    confirmed = (
+        (intent == "confirm_action" and answered_confirmation or retrying_creation)
+        and not ran("confirm_conversion")
+        and conv.get("awaiting_fingerprint") == current
+    )
+    if confirmed:
+        return "create_account" if not ran("create_account") else "respond"
+    return "confirm_conversion" if not ran("confirm_conversion") else "respond"
 
 
 def _unmerged(state: ContactUsChatState, ran: Callable[[str], int]) -> bool:
@@ -262,10 +364,16 @@ def chat_result(state: ContactUsChatState) -> dict[str, Any]:
         requests, context = [request_summary(r) for r in listed_records(state)[:25]], "listed"
 
     selected = state.get("contact_request")
-    show_customer = state.get("operation") == "create_customer" or state.get("is_complete") or state.get("intent") in (
-        "create_customer",
-        "provide_information",
-        "show_request_details",
+    conv = conversion_of(state)
+    show_customer = (
+        state.get("operation") in CONVERSION_OPERATIONS
+        or state.get("is_complete")
+        or bool(conv.get("request_id") and selected and conv.get("request_id") == selected.get("id"))
+        or state.get("intent") in ("provide_information", "show_request_details", *CONVERSION_OPERATIONS)
+    )
+    ctype = active_type(state)
+    providers = (state.get("provider_results") or {}).get("providers") or (
+        conv.get("provider_candidates") if (state.get("pending_question") or {}).get("type") == "choose_provider" else None
     )
     return {
         "sessionId": state.get("session_id"),
@@ -274,6 +382,7 @@ def chat_result(state: ContactUsChatState) -> dict[str, Any]:
         "workflowStatus": state.get("workflow_status"),
         "intent": state.get("intent"),
         "operation": state.get("operation"),
+        "conversionType": ctype.key if ctype else None,
         "awaitingUserInput": bool(state.get("awaiting_user_input")),
         "pendingQuestion": state.get("pending_question"),
         "providerName": state.get("provider_name"),
@@ -282,6 +391,7 @@ def chat_result(state: ContactUsChatState) -> dict[str, Any]:
         "requestsTotal": state.get("contact_requests_total") if context == "listed" else None,
         "selectedRequest": request_summary(selected) if selected else None,
         "customer": customer_view(state) if show_customer else None,
+        "providers": providers or [],
         "extraInformation": state.get("extra_information") or {},
     }
 
@@ -302,7 +412,7 @@ async def run_contact_us_chat_turn(
     configurable: dict[str, Any] = {"thread_id": session_id, "bootog_client": client, "emitter": emitter}
     if llm is not None:
         configurable["llm"] = llm
-    config: RunnableConfig = {"configurable": configurable, "recursion_limit": 40}
+    config: RunnableConfig = {"configurable": configurable, "recursion_limit": 60}
     inputs: ContactUsChatState = {
         "run_id": channel.run_id,
         "session_id": session_id,

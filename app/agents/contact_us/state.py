@@ -16,6 +16,7 @@ class ContactUsAgentState(TypedDict, total=False):
 
     contact_requests: list[dict[str, Any]]
     contact_requests_total: int
+    contact_requests_truncated: bool  # a search hit the page limit before reading everything
     contact_request: dict[str, Any] | None
     customer_payload: dict[str, Any] | None
     missing_required_fields: list[str]
@@ -78,9 +79,24 @@ class ContactUsChatState(ContactUsAgentState, total=False):
     agent_response: str | None
     completed_steps: list[str]
     failed_steps: list[str]
+    # Conversion details named in this message (see understanding.ConversionDetails):
+    # partner_type, target_provider_name, option_position, subcategory_names.
+    turn_conversion: dict[str, Any]
+    answered_question: dict[str, Any] | None  # the pending question this message answers
+    provider_query: dict[str, Any] | None  # "list/find providers": {"name", "location"}
+    provider_results: dict[str, Any] | None
+    refreshed: bool  # the request list was re-read after a conversion
 
     # Kept across turns
-    operation: str | None  # ongoing workflow goal, e.g. "create_customer"
+    operation: str | None  # ongoing workflow goal: create_customer / create_b2b_client / create_partner
+    # The conversion in progress, bound to one request. Holds only ids, names and step
+    # outcomes from real API responses — never credentials:
+    #   type, request_id, role_id, role_name, target_provider {id, name},
+    #   provider_candidates, subcategories [{id, name}], account {...},
+    #   awaiting_fingerprint (what the user was asked to confirm), create_attempted,
+    #   created_vendor_id, user_id, completed [steps], failed {step, message, outcome_unknown}
+    conversion: dict[str, Any] | None
+    assigned_users_cache: dict[str, Any] | None  # {"at": epoch seconds, "users": [{id, name}]}
     listed_request_ids: list[str]  # order of the requests last shown to the user
     user_customer_fields: dict[str, str]  # values the user supplied (latest wins)
     known_fields: list[str]

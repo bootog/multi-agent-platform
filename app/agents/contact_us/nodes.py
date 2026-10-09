@@ -31,7 +31,12 @@ class StepResult:
 
 
 class StepFailed(Exception):
-    """Expected failure with a user-safe message."""
+    """Expected failure with a user-safe message. `update` is still applied to the state
+    (e.g. "the account was created, then linking failed"), so a retry can resume safely."""
+
+    def __init__(self, message: str, update: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.update = update or {}
 
 
 class StepBlocked(Exception):
@@ -62,7 +67,7 @@ def tracked_step(step_id: str, running_message: str | Callable[[ContactUsAgentSt
                 log_step(logger, AGENT, run_id, step_id, "blocked", elapsed())
                 return {"current_step": step_id, "execution_status": "blocked", "error": str(exc)}
             except StepFailed as exc:
-                return await _fail(emitter, run_id, step_id, str(exc), elapsed())
+                return {**exc.update, **await _fail(emitter, run_id, step_id, str(exc), elapsed())}
             except BootogApiError as exc:
                 return await _fail(emitter, run_id, step_id, f"{failure_message} {exc.message}", elapsed())
             except Exception as exc:  # unexpected: keep details in logs only
@@ -127,21 +132,30 @@ async def get_contact_us_data(state: ContactUsAgentState, config: RunnableConfig
         {
             "provider_id": state.get("provider_id"),
             "contact_name": filters.get("contact_name"),
+            "email": filters.get("email"),
             "created_from": filters.get("created_from"),
             "created_to": filters.get("created_to"),
             "module_filter": state.get("module_filter"),
+            "statuses": filters.get("statuses"),
+            "all_statuses": bool(filters.get("all_statuses")),
+            "assigned_user_ids": filters.get("assigned_user_ids"),
+            "request_id": filters.get("request_id"),
         },
         config=config,
     )
     records, total = page["records"], page["total"]
     noun = _request_noun(state)
-    if len(records) == total:
+    if page.get("search"):
+        message = f"Searched all {noun}s — {len(records)} match{'es' if len(records) != 1 else ''}"
+        if page.get("truncated"):
+            message += " (search stopped at the page limit; older requests may be missing)"
+    elif len(records) == total:
         message = f"Retrieved {total} {noun}{'s' if total != 1 else ''}"
     else:
         message = f"Retrieved the latest {len(records)} of {total} {noun}s"
     return StepResult(
         message,
-        {"contact_requests": records, "contact_requests_total": total},
+        {"contact_requests": records, "contact_requests_total": total, "contact_requests_truncated": bool(page.get("truncated"))},
         data={"retrieved": len(records), "total": total},
     )
 

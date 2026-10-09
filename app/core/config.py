@@ -27,6 +27,17 @@ class Settings:
     # How many Contact Us requests the agent reads per run (latest first).
     contact_us_page_size: int
     allowed_origins: list[str]
+    # Extra attempts for safe GETs (timeouts, transport errors, 502/503/504). POST/PUT never retry.
+    bootog_get_retries: int = 2
+    bootog_retry_backoff_seconds: float = 0.3
+    # Upper bound on pages read when a lookup must page through a Bootog list
+    # (requests, providers, subcategories). Hitting it is reported, never hidden.
+    bootog_max_pages: int = 10
+    # Sent as X-Client-Type on every Bootog call when set. NOT needed: writes pass the
+    # gateway's anti-forgery check with the caller's own XSRF token (integrations/bootog/
+    # client.py). Only "Mobile" is accepted (the gateway then skips that check) and only
+    # with the Bootog team's authorisation; anything else is ignored with a warning.
+    bootog_client_type: str | None = None
 
     # OpenAI. The chat model drives LangGraph reasoning (understanding, extraction,
     # replies). OPENAI_REALTIME_MODEL is reserved for realtime/voice features and is
@@ -55,6 +66,10 @@ def get_settings() -> Settings:
         bootog_timeout_seconds=float(os.getenv("BOOTOG_TIMEOUT_SECONDS", "20")),
         contact_us_page_size=int(os.getenv("CONTACT_US_PAGE_SIZE", "50")),
         allowed_origins=_csv(os.getenv("ALLOWED_ORIGINS", "http://localhost:4201")),
+        bootog_get_retries=int(os.getenv("BOOTOG_GET_RETRIES", "2")),
+        bootog_retry_backoff_seconds=float(os.getenv("BOOTOG_RETRY_BACKOFF_SECONDS", "0.3")),
+        bootog_max_pages=int(os.getenv("BOOTOG_MAX_PAGES", "10")),
+        bootog_client_type=(os.getenv("BOOTOG_CLIENT_TYPE") or "").strip() or None,
         openai_api_key=os.getenv("OPENAI_API_KEY") or None,
         openai_chat_model=os.getenv("OPENAI_CHAT_MODEL") or "gpt-4.1-mini",
         openai_temperature=_float_or_none(os.getenv("OPENAI_TEMPERATURE", "0.2")),

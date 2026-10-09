@@ -106,9 +106,9 @@ class ProviderOut(CamelModel):
 
 
 # --- Customer draft -------------------------------------------------------
-# Fields of the Bootog "New Customer" form. This is the agent's internal draft,
-# NOT an API payload: the customer-creation API and its field names are not
-# documented in ContactUS.pdf, so nothing is sent until that mapping is confirmed.
+# Fields of the Bootog "New Customer" form, used for request cards and the run workflow.
+# The chat agent's conversion forms (and the AddVendorUser payload) are defined in
+# conversions.py.
 
 CUSTOMER_FIELDS: list[tuple[str, str, str, bool]] = [
     # (draft field, Contact Us source field, form label, required)
@@ -116,7 +116,7 @@ CUSTOMER_FIELDS: list[tuple[str, str, str, bool]] = [
     ("lastName", "lastName", "Last Name", True),
     ("email", "emailId", "Email", True),
     ("phoneNumberCode", "phoneNumberCode", "Phone Code", False),
-    ("phone", "phone", "Phone Number", False),
+    ("phone", "phone", "Phone Number", True),  # required by the host customer popup
     ("address1", "address1", "Street Address 1", True),
     ("address2", "address2", "Street Address 2", False),
     ("city", "city", "City", True),
