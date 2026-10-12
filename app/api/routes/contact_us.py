@@ -95,8 +95,14 @@ async def send_contact_us_chat_message(
         raise HTTPException(status.HTTP_409_CONFLICT, detail="The agent is still working on your previous message.")
 
     message = (request.message or "").strip() or None
+    form = request.form.model_dump(by_alias=False) if request.form else None
+    if form and not message:
+        # A form turn is a user action, never "Run Agent": give the transcript a line for it.
+        message = "Create the customer" if form["action"] == "create" else "Submitted the details form"
     channel = registry.create("contact-us")
-    turn = start_turn_task(channel, session_id, message, BootogClient(auth), request.agent_key, request.agent_label)
+    turn = start_turn_task(
+        channel, session_id, message, BootogClient(auth), request.agent_key, request.agent_label, form=form
+    )
     registry.track(turn)
     registry.track(record_turn(turn, channel, session_id, owner, agent, message))
     return ChatTurnStarted(run_id=channel.run_id, session_id=session_id, session_restarted=restarted)

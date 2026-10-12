@@ -27,13 +27,15 @@ from app.agents.contact_us.conversion_nodes import (
     draft_type,
 )
 from app.agents.contact_us.conversions import (
-    CONVERSION_OPERATIONS,
+    ADDRESS_FORM_FIELDS,
     ALL_TYPES,
+    CONVERSION_OPERATIONS,
     FIELD_LABELS,
     PARTNER_TYPES,
-    is_placeholder,
     STEP_LABELS,
+    build_draft,
     conversion_type,
+    is_placeholder,
     validate_draft,
 )
 from app.agents.contact_us.nodes import StepFailed, StepResult, tracked_step
@@ -161,7 +163,7 @@ def _tokens(text: str | None) -> list[str]:
 
 def _name_matches(reference: str, record: dict[str, Any]) -> bool:
     """Every word of the reference matches a word of the name: exactly, as a prefix (3+
-    letters), or — for a single letter — as an initial ("Gokulan A" matches "Gokulan Alice")."""
+    letters), or — for a single letter — as an initial ("Sam A" matches "Sam Avery")."""
     wanted = re.findall(r"[^\W_]+", (reference or "").casefold())
     have = re.findall(r"[^\W_]+", f"{record.get('firstName') or ''} {record.get('lastName') or ''}".casefold())
     return bool(wanted) and all(
@@ -298,6 +300,12 @@ async def start_turn(state: ContactUsChatState, config: RunnableConfig) -> dict[
         "provider_query": None,
         "provider_results": None,
         "refreshed": False,
+        "form_submitted": False,
+        "explicit_create": False,
+        "completed_this_turn": False,
+        "rejected_field_updates": {},
+        "post_creation_edit": [],
+        "edit_request": None,
         "tool_errors": [],
         "last_tool_result": None,
         "agent_response": None,
@@ -311,6 +319,8 @@ async def start_turn(state: ContactUsChatState, config: RunnableConfig) -> dict[
 
 @tracked_step("understand_message", "Understanding your message", "I couldn't interpret that message.")
 async def understand_message(state: ContactUsChatState, config: RunnableConfig) -> StepResult:
+    if state.get("form_submission"):
+        return _understand_form(state, state["form_submission"])
     try:
         result = await understand(config, state.get("conversation_history") or [], _state_summary(state))
     except LlmNotConfiguredError as exc:
@@ -364,6 +374,19 @@ async def understand_message(state: ContactUsChatState, config: RunnableConfig) 
         for item in result.extra_information
         if _snake(item.key) and item.value.strip()
     }
+
+    previous_question = (state.get("pending_question") or {}).get("type")
+    if conv is not None and conv.review_first:
+        update["turn_conversion"] = {**update.get("turn_conversion", {}), "review_first": True}
+    if result.intent == "review_details":
+        update["turn_conversion"] = {**update.get("turn_conversion", {}), "review_first": True}
+    # "Create it" counts only as the answer to the ready-to-create summary the user saw.
+    update["explicit_create"] = previous_question == "ready_to_create" and result.intent in (
+        "confirm_action", "create_customer", "convert_request"
+    )
+    if result.intent == "edit_details" and not update.get("turn_field_updates"):
+        wanted = _edit_fields(conv.edit_fields if conv is not None else [])
+        update["edit_request"] = {"fields": wanted}
 
     filters: dict[str, Any] = {}
     ignored: list[str] = []
@@ -515,6 +538,83 @@ def _apply_discriminators(records: list[dict[str, Any]], ref: dict[str, Any]) ->
     return out
 
 
+def _edit_fields(requested: list[str]) -> list[str]:
+    """Field keys the user wants to change ("address" = the address fields); all editable
+    fields when nothing specific was named."""
+    keys: list[str] = []
+    for item in requested:
+        name = (item or "").strip()
+        if name.casefold() == "address":
+            keys += list(ADDRESS_FORM_FIELDS)
+        elif name in FIELD_LABELS and name not in ("latitude", "longitude"):
+            keys.append(name)
+        else:
+            label_match = [k for k, label in FIELD_LABELS.items() if label.casefold() == name.casefold()]
+            keys += label_match
+    return list(dict.fromkeys(keys)) or [k for k in FIELD_LABELS if k not in ("latitude", "longitude")]
+
+
+def _understand_form(state: ContactUsChatState, form: dict[str, Any]) -> StepResult:
+    """A chat card's structured form: no interpretation needed, so no LLM call. Only known
+    fields of the current conversion form are taken, for the request the card belongs to."""
+    record = state.get("contact_request") or {}
+    update: dict[str, Any] = {
+        "answered_question": state.get("pending_question"),
+        "pending_question": None,
+        "awaiting_user_input": False,
+        "request_reference": {"use_current": True},
+    }
+    if not record or str(form.get("request_id")) != str(record.get("id")):
+        # The card belongs to a request that is no longer selected: apply nothing.
+        update.update(intent="other", request_summary="Submitted a form for another request",
+                      last_tool_result={"form": "This form belongs to a request that is no longer selected; nothing was changed."})
+        return StepResult("Form ignored — it belongs to another request", update)
+
+    ctype = draft_type(state)
+    current = customer_draft(state) or {}
+    fields: dict[str, str] = {}
+    for key, value in (form.get("fields") or {}).items():
+        if key not in ctype.fields or key in ("latitude", "longitude") or not isinstance(value, str):
+            continue
+        text = " ".join(value.split())[:200]
+        if not text or is_placeholder(text):
+            continue  # an empty input never clears a value that is already there
+        if text.casefold() != " ".join(str(current.get(key) or "").split()).casefold():
+            fields[key] = text
+    if "latitude" in ctype.fields:
+        for key, value in _form_coordinates(form.get("fields") or {}).items():
+            if value != str(current.get(key) or ""):
+                fields[key] = value
+    create = form.get("action") == "create"
+    operation = state.get("operation") if state.get("operation") in CONVERSION_OPERATIONS else ctype.operation
+    update.update(
+        intent="confirm_action" if create else "provide_information",
+        request_summary="Create the customer" if create else "Submitted the details form",
+        operation=operation,
+        turn_field_updates=fields,
+        form_submitted=True,
+        explicit_create=create,
+    )
+    label = "Create requested" if create else (f"Details submitted: {', '.join(FIELD_LABELS[k] for k in fields)}" if fields else "Details submitted (no changes)")
+    return StepResult(label, update, data={"form": form.get("action"), "fields": list(fields)})
+
+
+def _form_coordinates(values: dict[str, Any]) -> dict[str, str]:
+    """Coordinates on a form submission: the card sends them only for an address picked
+    from Google Places and not edited since (they are never typed in). Taken only as a
+    pair of in-range numbers; anything else is dropped, never guessed."""
+    lat, lng = values.get("latitude"), values.get("longitude")
+    if not isinstance(lat, str) or not isinstance(lng, str):
+        return {}
+    try:
+        lat_n, lng_n = float(lat), float(lng)
+    except ValueError:
+        return {}
+    if not (-90 <= lat_n <= 90 and -180 <= lng_n <= 180) or (lat_n == 0 and lng_n == 0):
+        return {}  # also NaN/inf; 0,0 is "not geocoded"
+    return {"latitude": lat.strip(), "longitude": lng.strip()}
+
+
 def _operation_for(intent: str, goal: str, current: str | None) -> str | None:
     operation = intent if intent in CONVERSION_OPERATIONS else goal if goal in CONVERSION_OPERATIONS else None
     if operation == "convert_request" and current in CONVERSION_OPERATIONS:
@@ -575,7 +675,7 @@ async def match_request(state: ContactUsChatState, config: RunnableConfig) -> St
             candidates = [r for r in candidates if (r.get("emailId") or "").casefold() == ref["email"].strip().casefold()]
         if ref.get("name"):
             candidates = [r for r in candidates if _name_matches(ref["name"], r)]
-            # "Gokulan A" means the people named exactly that when there are any; an
+            # "Sam A" means the people named exactly that when there are any; an
             # initial only widens the match when nobody has the exact name.
             exact = [r for r in candidates if _exact_name(ref["name"], r)]
             candidates = exact or candidates
@@ -648,28 +748,73 @@ def _waiting_for_request(message: str, match: dict[str, Any]) -> StepResult:
 
 @tracked_step("merge_customer_fields", "Recording the information you provided", "Unable to record that information.")
 async def merge_customer_fields(state: ContactUsChatState, config: RunnableConfig) -> StepResult:
-    previous = state.get("user_customer_fields") or {}
-    updates = state.get("turn_field_updates") or {}
-    extra_new = state.get("turn_extra_information") or {}
+    """Merges this turn's values into the one draft of the selected request.
 
-    corrected = [FIELD_LABELS[k] for k, v in updates.items() if previous.get(k) and previous[k] != v]
-    received = [FIELD_LABELS[k] for k in updates if FIELD_LABELS[k] not in corrected]
+    - Empty values never reach here (dropped when understood), so nothing is cleared.
+    - A value that would make the draft invalid is not stored; the previous value stays
+      and the rejection is reported ("Reject invalid values without destroying the
+      previous valid value").
+    - Once the account exists, nothing changes: there is no BOOTOG API to update it, and
+      the draft must keep matching what was created.
+    - `completed_this_turn`: the draft was incomplete before and is complete now — the
+      user's message supplied the last missing details."""
+    previous = state.get("user_customer_fields") or {}
+    updates = dict(state.get("turn_field_updates") or {})
+    extra_new = state.get("turn_extra_information") or {}
+    update: dict[str, Any] = {"extra_information": {**(state.get("extra_information") or {}), **extra_new}}
+    noted = f"Noted: {', '.join(k.replace('_', ' ') for k in extra_new)}" if extra_new else ""
+
+    if updates and account_exists(state):
+        labels = [FIELD_LABELS[k] for k in updates]
+        update["post_creation_edit"] = labels
+        message = "The account already exists — changes were not applied: " + ", ".join(labels)
+        return StepResult(" · ".join(p for p in (message, noted) if p), update, data={"fields": []})
+
+    record = state.get("contact_request")
+    rejected: dict[str, str] = {}
+    candidate = {**previous, **updates}
+    completed = False
+    if record:
+        ctype = draft_type(state)
+        _, missing_before, invalid_before = validate_draft(ctype, build_draft(ctype, record, previous))
+        _, _, invalid = validate_draft(ctype, build_draft(ctype, record, candidate))
+        for key in updates:
+            reason = invalid.get(FIELD_LABELS[key])
+            if reason:
+                rejected[FIELD_LABELS[key]] = reason
+                if key in previous:
+                    candidate[key] = previous[key]
+                else:
+                    candidate.pop(key)
+        _, missing_after, invalid_after = validate_draft(ctype, build_draft(ctype, record, candidate))
+        applied = {k for k in updates if candidate.get(k) == updates[k]}
+        completed = bool(applied) and bool(missing_before or invalid_before) and not (missing_after or invalid_after)
+
+    applied_keys = [k for k in updates if candidate.get(k) == updates[k]]
+    corrected = [FIELD_LABELS[k] for k in applied_keys if previous.get(k) and previous[k] != updates[k]]
+    received = [FIELD_LABELS[k] for k in applied_keys if FIELD_LABELS[k] not in corrected]
     parts = []
     if received:
         parts.append(f"Received: {', '.join(received)}")
     if corrected:
         parts.append(f"Corrected: {', '.join(corrected)}")
-    if extra_new:
-        parts.append(f"Noted: {', '.join(k.replace('_', ' ') for k in extra_new)}")
-    return StepResult(
-        " · ".join(parts) or "Nothing new to record",
-        {
-            # Never overwrite with empty values: only non-empty updates reach here.
-            "user_customer_fields": {**previous, **updates},
-            "extra_information": {**(state.get("extra_information") or {}), **extra_new},
-        },
-        data={"fields": received + corrected},
-    )
+    if rejected:
+        parts.append(f"Not accepted: {', '.join(rejected)}")
+    if noted:
+        parts.append(noted)
+    update.update(user_customer_fields=candidate, rejected_field_updates=rejected, completed_this_turn=completed)
+    return StepResult(" · ".join(parts) or "Nothing new to record", update, data={"fields": received + corrected})
+
+
+def account_exists(state: ContactUsChatState) -> bool:
+    """The account for the selected request and conversion type was created (in this
+    conversation), so its details can no longer change through this workflow."""
+    record = state.get("contact_request") or {}
+    conv = conversion_of(state)
+    if conv.get("request_id") == record.get("id") and "create_account" in (conv.get("completed") or []):
+        return True
+    ctype = active_type(state)
+    return bool(ctype and (state.get("created_customers") or {}).get(converted_key(record.get("id"), ctype.key)))
 
 
 @tracked_step("validate_customer_data", "Validating the details", "Unable to validate the details.")
@@ -804,19 +949,95 @@ def creation_status(state: ContactUsChatState) -> dict[str, Any]:
     return {"status": "not_attempted"}
 
 
+_NOT_TYPED = ("latitude", "longitude")  # never typed in: from the request only
+
+
+def conversion_state(state: ContactUsChatState, missing: list[str], invalid: dict[str, str]) -> str:
+    """Where the operation stands, from structured state only (never from the reply):
+    collecting · ready · confirming · existing_customer · failed · outcome_unknown ·
+    status_pending (account created, request not yet CRM Completed) · partial (account
+    created, another step pending) · completed."""
+    record = state.get("contact_request") or {}
+    conv = conversion_of(state)
+    if conv.get("request_id") != record.get("id"):
+        conv = {}
+    ctype = active_type(state)
+    done = set(conv.get("completed") or [])
+    if (ctype and set(ctype.steps()) <= done) or conv.get("blocked") == "already_converted" or (
+        ctype and (state.get("created_customers") or {}).get(converted_key(record.get("id"), ctype.key))
+    ):
+        return "completed"
+    if "create_account" in done:
+        pending = [s for s in ctype.steps() if s not in done] if ctype else []
+        return "status_pending" if pending == ["update_request_status"] else "partial"
+    failed = conv.get("failed") or {}
+    if failed.get("step") == "create_account":
+        return "outcome_unknown" if failed.get("outcome_unknown") else "failed"
+    if conv.get("blocked") == "existing_role":
+        return "existing_customer"
+    if missing or invalid:
+        return "collecting"
+    if (conv.get("account") or {}).get("verified") is False or conv.get("role_unverified"):
+        return "unverified"  # the account or role check failed: nothing can be created yet
+    question = (state.get("pending_question") or {}).get("type")
+    if question == "confirm_conversion":
+        return "confirming"
+    return "ready"
+
+
+def existing_account_warning(ctype_label: str) -> str:
+    """The host app's wording for this case (contact-us.component.ts, "Customer" action)."""
+    return f"{ctype_label} already exists with this email address."
+
+
 def customer_view(state: ContactUsChatState) -> dict[str, Any] | None:
-    """The conversion form for the UI: every field, where its value came from, what's missing."""
-    draft = customer_draft(state)
-    if draft is None:
+    """The conversion card for the UI, from the one authoritative draft: every field with
+    its value (as it would be sent: FL, US, phone mask), source and status, what the
+    form should ask for, and where the operation stands."""
+    raw = customer_draft(state)
+    if raw is None:
         return None
     ctype = draft_type(state)
-    draft, missing, _ = validate_draft(ctype, draft)  # show what would be sent (FL, US, phone mask)
+    draft, missing, invalid = validate_draft(ctype, raw)
+    # A value the user just tried to set and that was not accepted is shown as that
+    # field's error (the previous value stays in place).
+    errors = {**invalid, **(state.get("rejected_field_updates") or {})}
     user_fields = state.get("user_customer_fields") or {}
     conv = conversion_of(state)
+    status = conversion_state(state, missing, errors)
+    editable = not account_exists(state) and status not in ("completed", "status_pending", "partial")
+    problem_keys = {k for k in ctype.fields if FIELD_LABELS[k] in missing or FIELD_LABELS[k] in errors}
+    form_fields = (
+        [k for k in ctype.fields if k in ADDRESS_FORM_FIELDS or k in problem_keys]
+        if editable and status == "collecting"
+        else []
+    )
+    record = state.get("contact_request") or {}
+    notice = None
+    if status == "existing_customer":
+        notice = {"level": "warning", "text": existing_account_warning(ctype.label)}
+    elif status == "unverified" and conv.get("role_unverified"):
+        notice = {
+            "level": "warning",
+            "text": f"The {ctype.label} role could not be verified in BOOTOG, so the account was not created. Please try again.",
+        }
+    elif status == "unverified":
+        notice = {
+            "level": "warning",
+            "text": "The existing-account check could not be completed, so the account was not created. Please try again.",
+        }
     return {
+        "requestId": record.get("id"),
+        "notice": notice,
         "conversionType": ctype.key,
         "conversionLabel": ctype.label,
         "serviceProvider": (conv.get("target_provider") or {}).get("name"),
+        "state": status,
+        "editable": editable,
+        # Inputs the card opens with (missing/invalid details plus the whole address);
+        # "Edit" opens every editable field.
+        "formFields": [k for k in form_fields if k not in _NOT_TYPED],
+        "editableFields": [k for k in ctype.fields if k not in _NOT_TYPED] if editable else [],
         "fields": [
             {
                 "key": key,
@@ -824,11 +1045,13 @@ def customer_view(state: ContactUsChatState) -> dict[str, Any] | None:
                 "value": draft.get(key),
                 "required": key in ctype.required,
                 "source": "user" if key in user_fields else ("request" if draft.get(key) else None),
+                "status": "invalid" if FIELD_LABELS[key] in errors else "missing" if FIELD_LABELS[key] in missing else "valid",
+                "error": errors.get(FIELD_LABELS[key]),
             }
             for key in ctype.fields
         ],
         "missingRequiredFields": missing,
-        "invalidFields": state.get("invalid_fields") or {},
+        "invalidFields": errors,
         "creation": creation_status(state),
     }
 
@@ -858,9 +1081,26 @@ def _conversion_facts(state: ContactUsChatState) -> dict[str, Any] | None:
             "roles": account.get("roles"),
         }
     if conv.get("blocked") == "existing_role":
+        record = state.get("contact_request") or {}
+        already_completed = record.get("status") == 11
+        found_later = bool((conv.get("account") or {}).get("found_after_failed_attempt"))
+        facts["existing_account_warning"] = "Warning: " + existing_account_warning(ctype.label)
         facts["blocked"] = (
-            f"The email is already registered with the {ctype.role_name} role. Nothing was created. "
-            "Alternatives: convert to a different type, use another email, or cancel."
+            f"The email is already registered with the {ctype.role_name} role, so no new account was created. "
+            + (
+                "BOOTOG had answered an earlier creation attempt with an error, and a check afterwards found "
+                "this role: it cannot be confirmed whether that attempt created it, so do NOT say it was "
+                "created. Nothing will be retried. "
+                if found_later
+                else ""
+            )
+            + (
+                "This Contact Us request is already marked CRM Completed."
+                if already_completed
+                else "That does NOT mean this Contact Us request was converted: it is still open "
+                f"({CONTACT_US_STATUS_LABELS.get(record.get('status'), 'open')}) and was not changed."
+            )
+            + " Alternatives: use another email, convert to a different type, or cancel. The collected details are kept."
         )
     elif conv.get("blocked") == "already_converted":
         label = conversion_type(conv.get("blocked_type")).label if conv.get("blocked_type") else "this type"
@@ -876,6 +1116,18 @@ def _conversion_facts(state: ContactUsChatState) -> dict[str, Any] | None:
             "next": _failure_advice(failed),
         }
     question = (state.get("pending_question") or {}).get("type")
+    if question == "ready_to_create":
+        draft = state.get("customer_payload") or {}
+        reason = (state.get("pending_question") or {}).get("reason")
+        facts["ready_for_creation"] = {
+            "type": ctype.label,
+            "details": {FIELD_LABELS[k]: v for k, v in draft.items() if v},
+            "why_waiting": {
+                "review_requested": "the user asked to review the details first",
+                "after_failure": "the last attempt failed; the details can be corrected first",
+            }.get(reason, "the details were changed after they were complete"),
+            "next": "Ask the user to check the details and say 'create' (or press Create customer) to create the account.",
+        }
     if question == "confirm_conversion":
         draft = state.get("customer_payload") or {}
         record = state.get("contact_request") or {}
@@ -922,6 +1174,24 @@ def _failure_advice(failed: dict[str, Any]) -> str:
         return (
             "Bootog's gateway refused the write (anti-forgery check). Nothing was created. An administrator "
             "must fix the agent's Bootog connection; then 'retry' sends it again."
+        )
+    if failed.get("reconciled") == "absent":
+        return (
+            "BOOTOG failed internally while creating the account (a server problem, not the details). "
+            "A check right afterwards found no account with this role for the email, so nothing usable was "
+            "created. 'retry' checks again before sending anything."
+        )
+    if failed.get("reconciled") == "unverified":
+        return (
+            "BOOTOG failed internally, and the follow-up check could not be completed either, so it is unknown "
+            "whether part of the account exists. Nothing is sent again until a check succeeds ('retry' checks first)."
+        )
+    if failed.get("code") == "SERVER_FAULT":
+        return (
+            "BOOTOG failed internally while creating the account; this is a server problem, not a "
+            "problem with the details. Part of the account (login and role) may already exist. "
+            "'retry' checks BOOTOG first and never creates a second account; if it still fails, "
+            "the BOOTOG team should look at this email's account."
         )
     if failed.get("step") == "create_account":
         if failed.get("kind") == "rejected":
@@ -1011,10 +1281,37 @@ def build_facts(state: ContactUsChatState) -> dict[str, Any]:
             facts["form"] = {
                 "converting": converting,
                 "form": view.get("conversionLabel"),
+                "operation_state": view.get("state"),
                 "fields": {f["label"]: f["value"] for f in view.get("fields", [])},
                 "missing_required": view.get("missingRequiredFields", []),
                 "invalid": view.get("invalidFields", {}),
-                "provided_this_turn": [FIELD_LABELS[k] for k in state.get("turn_field_updates") or {}],
+                "provided_this_turn": [
+                    FIELD_LABELS[k] for k in state.get("turn_field_updates") or {}
+                    if FIELD_LABELS[k] not in (state.get("rejected_field_updates") or {})
+                ],
+                "submitted_from_form": bool(state.get("form_submitted")),
+                "the_card_shows_a_form": bool(view.get("formFields")),
+            }
+        if state.get("rejected_field_updates"):
+            facts["rejected_changes"] = {
+                "not_accepted": state["rejected_field_updates"],
+                "previous_values_kept": True,
+                "account_not_created_this_turn": True,
+            }
+        if state.get("post_creation_edit") or (state.get("edit_request") and account_exists(state)):
+            fields = state.get("post_creation_edit") or [
+                FIELD_LABELS[k] for k in (state.get("edit_request") or {}).get("fields") or []
+            ]
+            facts["post_creation_edit"] = {
+                "fields": fields,
+                "saved": False,
+                "why": "The account already exists. This workflow has no BOOTOG API to update an existing "
+                "account, so the change was not saved anywhere; it has to be made in BOOTOG directly.",
+            }
+        if state.get("edit_request") and not account_exists(state):
+            facts["edit_request"] = {
+                "fields_offered": [FIELD_LABELS[k] for k in state["edit_request"].get("fields") or []],
+                "next": "Ask which of these to change and the new value (the card shows them as a form).",
             }
         conversion = _conversion_facts(state)
         if conversion:

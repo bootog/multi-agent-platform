@@ -123,7 +123,12 @@ async def get_accounts_by_email(config: RunnableConfig, email: str) -> list[dict
         {
             "userId": a.user_id,
             "userName": a.user_name,
-            "roles": [{"providerId": r.provider_id, "providerName": r.provider_name, "roleName": r.role_name} for r in a.roles],
+            # Active roles only: a deleted role (isDelete) is not an existing role.
+            "roles": [
+                {"providerId": r.provider_id, "providerName": r.provider_name, "roleName": r.role_name}
+                for r in a.roles
+                if r.active
+            ],
         }
         for a in accounts
     ]

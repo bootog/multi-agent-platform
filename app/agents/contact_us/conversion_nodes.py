@@ -39,7 +39,7 @@ from app.agents.contact_us.conversions import (
     fingerprint,
     generate_password,
 )
-from app.agents.contact_us.nodes import StepFailed, StepResult, tracked_step
+from app.agents.contact_us.nodes import StepBlocked, StepFailed, StepResult, tracked_step
 from app.agents.contact_us.state import ContactUsChatState
 from app.agents.contact_us.tools import (
     get_accounts_by_email,
@@ -169,6 +169,12 @@ async def start_conversion(state: ContactUsChatState, config: RunnableConfig) ->
         conv["pending_provider_name"] = turn["target_provider_name"]
     if turn.get("subcategory_names"):
         conv["pending_subcategory_names"] = turn["subcategory_names"]
+    # "Let me check the details first": hold automatic creation until the user explicitly
+    # asks for it (the summary's "Create customer", or "create it" answering it).
+    if turn.get("review_first"):
+        conv["review_hold"] = True
+    if state.get("explicit_create"):
+        conv["review_hold"] = False
     return StepResult(message, {"conversion": conv})
 
 
@@ -360,14 +366,19 @@ async def check_existing_account(state: ContactUsChatState, config: RunnableConf
     conv = conversion_of(state)
     ctype = active_type(state)
     email = (state.get("customer_payload") or {}).get("email") or ""
-    accounts: list[dict[str, Any]] = []
-    for candidate in dict.fromkeys([email, email.casefold()]):  # Bootog matches case-sensitively
-        accounts += await get_accounts_by_email.ainvoke({"email": candidate}, config=config)
+    try:
+        accounts = await lookup_accounts(config, email)
+    except BootogApiError as exc:
+        # Not knowing is never "no account": stop before any creation.
+        conv["account"] = {"email": email, "verified": False, "error": exc.message}
+        message = f"The existing-account check for {email} could not be completed, so nothing was created. {exc.message}"
+        raise StepFailed(message, {"conversion": conv}) from exc
 
     roles = [r for a in accounts for r in a["roles"]]
     with_role = [r for r in roles if r["roleName"].casefold() == ctype.role_name.casefold()]
     conv["account"] = {
         "email": email,
+        "verified": True,
         "exists": bool(accounts),
         "has_role": bool(with_role),
         "roles": sorted({r["roleName"] for r in roles})[:10],
@@ -375,6 +386,13 @@ async def check_existing_account(state: ContactUsChatState, config: RunnableConf
     lost_answer = (conv.get("failed") or {}).get("step") == "create_account" and (conv.get("failed") or {}).get(
         "outcome_unknown"
     )
+    if with_role and lost_answer and ctype.auto_create:
+        # Customer: a Customer role found after an attempt whose answer was lost is
+        # reported as an existing Customer. It may or may not come from that attempt —
+        # never claimed as created by it, and the request is not marked converted.
+        conv.update(blocked="existing_role", failed=None)
+        conv["account"]["found_after_failed_attempt"] = True
+        return StepResult(f"{email}: Customer already exists — not created again", {"conversion": conv})
     if with_role and lost_answer:
         # An earlier attempt whose answer was lost did create the account: adopt it.
         vendor = next((r["providerId"] for r in with_role if is_guid(r.get("providerId"))), None)
@@ -394,9 +412,12 @@ async def resolve_role(state: ContactUsChatState, config: RunnableConfig) -> Ste
     ctype = active_type(state)
     try:
         role_id = await get_default_role_id.ainvoke({"role_name": ctype.role_name}, config=config)
-    except RoleNotFoundError as exc:
-        raise StepFailed(exc.message) from exc
-    conv.update(role_id=role_id, role_name=ctype.role_name)
+    except BootogApiError as exc:  # RoleNotFoundError, HTTP errors, timeouts
+        # Without a verified role nothing is created; the card shows why.
+        conv["role_unverified"] = exc.message
+        raise StepFailed(f"The {ctype.role_name} role could not be verified, so nothing was created. {exc.message}",
+                         {"conversion": conv}) from exc
+    conv.update(role_id=role_id, role_name=ctype.role_name, role_unverified=None)
     return StepResult(f"Role {ctype.role_name} resolved", {"conversion": conv})
 
 
@@ -472,6 +493,30 @@ async def select_subcategories(state: ContactUsChatState, config: RunnableConfig
     )
 
 
+async def present_details(state: ContactUsChatState, config: RunnableConfig) -> dict[str, Any]:
+    """Auto-created types (Customer): the details are complete and valid, but this turn did
+    not authorise creation (the user asked to review, corrected a complete draft, or the
+    last attempt failed). Show the editable summary and wait for an explicit "create"."""
+    conv = conversion_of(state)
+    conv["awaiting_fingerprint"] = conversion_fingerprint(state)
+    reason = (
+        "review_requested" if conv.get("review_hold")
+        else "after_failure" if conv.get("failed")
+        else "details_changed"
+    )
+    await _emitter(config).step("present_details", "waiting", "Details ready — waiting for the go-ahead to create")
+    return _waiting(
+        {"conversion": conv, "current_step": "present_details"}, {"type": "ready_to_create", "reason": reason}
+    )
+
+
+async def ask_edit_fields(state: ContactUsChatState, config: RunnableConfig) -> dict[str, Any]:
+    """"I need to change my address" without a new value: ask which field(s), offering them."""
+    fields = (state.get("edit_request") or {}).get("fields") or []
+    await _emitter(config).step("ask_edit_fields", "waiting", "Waiting for the new value(s)")
+    return _waiting({"current_step": "ask_edit_fields"}, {"type": "edit_fields", "fields": fields})
+
+
 async def confirm_conversion(state: ContactUsChatState, config: RunnableConfig) -> dict[str, Any]:
     conv = conversion_of(state)
     conv["awaiting_fingerprint"] = conversion_fingerprint(state)
@@ -501,16 +546,57 @@ async def create_account(state: ContactUsChatState, config: RunnableConfig) -> S
         # is not — the account may exist, so the next attempt checks Bootog before creating.
         unknown = exc.outcome_unknown
         kind = "unknown" if unknown else "access" if exc.status_code in (401, 403) else "rejected"
+        reconciled = None
+        if unknown and ctype.auto_create:
+            # Reconcile now (Customer): BOOTOG may have written the role before failing.
+            reconciled = await _role_after_failure(config, conv, ctype)
+            if reconciled == "found":
+                conv.update(blocked="existing_role", failed=None)
+                raise StepBlocked(
+                    f"{ctype.label} already exists with this email address — no second account was created.",
+                    {"conversion": conv},
+                ) from exc
+            if reconciled == "absent":
+                unknown, kind = False, "server_error"  # confirmed: no account to resume
         message = f"The account could not be created. {exc.message}"
         failure = _failure(
             conv, "create_account", message,
             outcome_unknown=unknown, kind=kind, code=exc.code, fingerprint=conv.get("awaiting_fingerprint"),
+            reconciled=reconciled,
         )
         raise StepFailed(message, failure) from exc
     finally:
         form.clear()  # drop the password as soon as the request is done
     conv = _completed(conv, "create_account", created_vendor_id=vendor_id)
     return StepResult(f"{ctype.label} account created", {"conversion": conv})
+
+
+async def lookup_accounts(config: RunnableConfig, email: str) -> list[dict[str, Any]]:
+    """GET UserDetail/GetUserRolesByEmailId through the shared client (active roles only).
+    BOOTOG matches the email case-sensitively, so the lower-case form is checked too.
+    Raises on any failure or malformed answer — never returns "no account" for it."""
+    accounts: list[dict[str, Any]] = []
+    for candidate in dict.fromkeys([email, email.casefold()]):
+        accounts += await get_accounts_by_email.ainvoke({"email": candidate}, config=config)
+    return accounts
+
+
+async def _role_after_failure(config: RunnableConfig, conv: dict[str, Any], ctype: ConversionType) -> str:
+    """After an ambiguous creation answer: does the email now have the role?
+    -> "found" | "absent" | "unverified" (the lookup itself failed: stay uncertain)."""
+    email = (conv.get("account") or {}).get("email") or ""
+    try:
+        accounts = await lookup_accounts(config, email)
+    except BootogApiError:
+        return "unverified"
+    found = any(r["roleName"].casefold() == ctype.role_name.casefold() for a in accounts for r in a["roles"])
+    if found:
+        conv["account"] = {
+            **(conv.get("account") or {}),
+            "verified": True, "exists": True, "has_role": True, "found_after_failed_attempt": True,
+        }
+        return "found"
+    return "absent"
 
 
 @tracked_step("verify_account", "Verifying the account", "Account verification failed.")

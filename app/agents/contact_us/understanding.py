@@ -27,6 +27,8 @@ Intent = Literal[
     "create_b2b_client",
     "create_partner",
     "convert_request",
+    "edit_details",
+    "review_details",
     "list_providers",
     "provide_information",
     "confirm_action",
@@ -44,6 +46,8 @@ INTENT_LABELS: dict[str, str] = {
     "create_b2b_client": "Create a B2B client",
     "create_partner": "Create a partner",
     "convert_request": "Convert the request",
+    "edit_details": "Change details",
+    "review_details": "Review the details",
     "list_providers": "Find service providers",
     "provide_information": "Information provided",
     "confirm_action": "Confirmation",
@@ -56,8 +60,9 @@ INTENT_LABELS: dict[str, str] = {
 CONVERSION_INTENTS = {"create_customer", "create_b2b_client", "create_partner", "convert_request"}
 REQUEST_INTENTS = {"find_request", "show_request_details"} | CONVERSION_INTENTS
 # Intents that move a conversion forward when one is in progress.
-ADVANCING_INTENTS = CONVERSION_INTENTS | {"provide_information", "confirm_action", "retry_operation"}
-WORKFLOW_INTENTS = REQUEST_INTENTS | {"provide_information", "confirm_action", "retry_operation"}
+_DETAIL_INTENTS = {"provide_information", "confirm_action", "retry_operation", "edit_details", "review_details"}
+ADVANCING_INTENTS = CONVERSION_INTENTS | _DETAIL_INTENTS
+WORKFLOW_INTENTS = REQUEST_INTENTS | _DETAIL_INTENTS
 
 
 class RequestReference(BaseModel):
@@ -103,6 +108,11 @@ class ConversionDetails(BaseModel):
         default_factory=list, description="Several 1-based choices from that list ('1 and 3')."
     )
     subcategory_names: list[str] = Field(default_factory=list, description="Contractor service categories named.")
+    edit_fields: list[str] = Field(
+        default_factory=list,
+        description="Fields the user wants to change but gave no new value for: field keys, or 'address' for the whole address.",
+    )
+    review_first: bool = Field(False, description="The user wants to see / check the details before the account is created.")
 
 
 class ProviderQuery(BaseModel):

@@ -79,6 +79,8 @@ NODES: dict[str, NodeFn] = {
     "resolve_role": conversion_nodes.resolve_role,
     "select_subcategories": conversion_nodes.select_subcategories,
     "confirm_conversion": conversion_nodes.confirm_conversion,
+    "present_details": conversion_nodes.present_details,
+    "ask_edit_fields": conversion_nodes.ask_edit_fields,
     "create_account": conversion_nodes.create_account,
     "verify_account": conversion_nodes.verify_account,
     "link_provider_vendor": conversion_nodes.link_provider_vendor,
@@ -174,8 +176,11 @@ def _conversion_step(state: ContactUsChatState, ran: Callable[[str], int]) -> st
     completed = conv.get("completed") or []
 
     if "create_account" in completed:
-        # The account exists: only resume the remaining steps, never create again.
-        if intent not in ("retry_operation", "confirm_action", *CONVERSION_INTENTS):
+        # The account exists: only resume the remaining steps, never create again. They run
+        # straight on after a creation in this turn, or when the user asks to continue —
+        # a correction or another message never re-runs them by itself.
+        continuing = ran("create_account") or intent in ("retry_operation", "confirm_action", *CONVERSION_INTENTS)
+        if not continuing:
             return "respond"
         for step in ctype.steps():
             if step not in completed:
@@ -186,6 +191,9 @@ def _conversion_step(state: ContactUsChatState, ran: Callable[[str], int]) -> st
 
     if ctype is None:
         return "choose_conversion_type" if not ran("choose_conversion_type") else "respond"
+    if state.get("edit_request") and not state.get("turn_field_updates"):
+        # "I need to change my address": ask which field / for the new value first.
+        return "ask_edit_fields" if not ran("ask_edit_fields") else "respond"
     turn = state.get("turn_conversion") or {}
     answered_provider = (state.get("answered_question") or {}).get("type") == "choose_provider" and turn.get("option_position")
     if ctype.needs_target_provider and (
@@ -228,6 +236,10 @@ def _conversion_step(state: ContactUsChatState, ran: Callable[[str], int]) -> st
         # Bootog rejected exactly these details: resending them can only fail again (or
         # hit a half-created account). The user has to change something or cancel.
         return "respond"
+    if ctype.auto_create:
+        if _creation_authorized(state, conv, current):
+            return "create_account" if not ran("create_account") else "respond"
+        return "present_details" if not ran("present_details") else "respond"
     # Approval must answer a confirmation the user has SEEN: the question was pending
     # before this message (or this is a retry of a failed creation), it was not asked in
     # this same turn, and nothing changed since. A message misread as "yes" while it
@@ -242,6 +254,38 @@ def _conversion_step(state: ContactUsChatState, ran: Callable[[str], int]) -> st
     if confirmed:
         return "create_account" if not ran("create_account") else "respond"
     return "confirm_conversion" if not ran("confirm_conversion") else "respond"
+
+
+def _creation_authorized(state: ContactUsChatState, conv: dict[str, Any], fingerprint: str) -> bool:
+    """Auto-created types (Customer): does THIS turn's user action authorise creating the
+    account from the complete, valid draft? Yes for the conversion command itself, a
+    submitted details form, a message that supplied the last missing details, an explicit
+    "create" answering the summary the user saw (unchanged since), or a retry after a
+    failed creation. No for a correction of an already complete draft, or while the user
+    asked to review first: those show the summary and wait. A completed or created
+    account never reaches here (the resume branch above handles it)."""
+    if conv.get("review_hold") and not state.get("explicit_create"):
+        return False
+    if state.get("rejected_field_updates"):
+        # The user tried to set a value that was not accepted: creating now would use the
+        # old value they were replacing. Ask for a valid one first.
+        return False
+    if state.get("explicit_create"):
+        # "Create" (card button or "create it") counts only for exactly the details the user
+        # was shown: nothing changed since that summary.
+        shown = conv.get("awaiting_fingerprint")
+        if shown:
+            return shown == fingerprint
+        return bool(state.get("form_submitted") and not state.get("turn_field_updates"))
+    if state.get("form_submitted") or state.get("completed_this_turn"):
+        return True
+    intent = state.get("intent")
+    if intent in ("create_customer", "convert_request"):
+        return True
+    if (state.get("answered_question") or {}).get("type") == "choose_conversion_type":
+        return True  # Customer picked from the "which account?" list
+    failed = conv.get("failed") or {}
+    return intent == "retry_operation" and failed.get("step") == "create_account"
 
 
 def _unmerged(state: ContactUsChatState, ran: Callable[[str], int]) -> bool:
@@ -405,8 +449,10 @@ async def run_contact_us_chat_turn(
     llm=None,
     agent_key: str | None = None,
     agent_label: str | None = None,
+    form: dict[str, Any] | None = None,
 ) -> ContactUsChatState:
-    """Run one turn, streaming activity into `channel`. Always closes the channel and client."""
+    """Run one turn, streaming activity into `channel`. Always closes the channel and client.
+    `form`: a chat card's structured submission ({action, request_id, fields})."""
     graph = graph or CONTACT_US_CHAT_GRAPH
     emitter = ChatEmitter(channel)
     configurable: dict[str, Any] = {"thread_id": session_id, "bootog_client": client, "emitter": emitter}
@@ -422,6 +468,7 @@ async def run_contact_us_chat_turn(
         "kickoff": not message,
         "current_user_message": message,
         "conversation_history": [{"role": "user", "content": message}] if message else [],
+        "form_submission": form,
     }
     try:
         state = await graph.ainvoke(inputs, config=config)
@@ -452,9 +499,12 @@ async def run_turn_in_session(
     client: BootogClient,
     agent_key: str | None = None,
     agent_label: str | None = None,
+    form: dict[str, Any] | None = None,
 ) -> None:
     try:
-        await run_contact_us_chat_turn(channel, session_id, message, client, agent_key=agent_key, agent_label=agent_label)
+        await run_contact_us_chat_turn(
+            channel, session_id, message, client, agent_key=agent_key, agent_label=agent_label, form=form
+        )
     finally:
         sessions.end(session_id)
 
@@ -466,5 +516,6 @@ def start_turn_task(
     client: BootogClient,
     agent_key: str | None = None,
     agent_label: str | None = None,
+    form: dict[str, Any] | None = None,
 ) -> asyncio.Task:
-    return asyncio.create_task(run_turn_in_session(channel, session_id, message, client, agent_key, agent_label))
+    return asyncio.create_task(run_turn_in_session(channel, session_id, message, client, agent_key, agent_label, form))

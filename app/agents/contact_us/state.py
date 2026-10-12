@@ -86,6 +86,14 @@ class ContactUsChatState(ContactUsAgentState, total=False):
     provider_query: dict[str, Any] | None  # "list/find providers": {"name", "location"}
     provider_results: dict[str, Any] | None
     refreshed: bool  # the request list was re-read after a conversion
+    # Structured form from the chat UI ({"action", "requestId", "fields"}), instead of text.
+    form_submission: dict[str, Any] | None
+    form_submitted: bool  # this turn submitted the details form (an explicit user action)
+    explicit_create: bool  # this turn explicitly asked to create the account now
+    completed_this_turn: bool  # this turn's values completed a draft that was incomplete
+    rejected_field_updates: dict[str, str]  # label -> why; the previous value was kept
+    post_creation_edit: list[str]  # labels the user tried to change after the account existed
+    edit_request: dict[str, Any] | None  # "I need to change my address" (no value yet)
 
     # Kept across turns
     operation: str | None  # ongoing workflow goal: create_customer / create_b2b_client / create_partner

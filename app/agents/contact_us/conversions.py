@@ -70,6 +70,9 @@ _ADDRESS = ("address1", "address2", "city", "state", "zipcode", "county", "count
 _ADDRESS_REQUIRED = ("address1", "city", "state", "zipcode", "county", "country")
 
 CUSTOMER_FORM = (*_PERSON, *_ADDRESS)
+# The structured address form (coordinates are never typed in; they come from the request
+# or from an address picked from Google suggestions on the form).
+ADDRESS_FORM_FIELDS = ("address1", "address2", "city", "state", "zipcode", "county", "country")
 COMPANY_FORM = ("companyName", *_PERSON, "website", "companyBio", "yearsInBusiness", "annualRevenue", *_ADDRESS)
 
 
@@ -88,6 +91,9 @@ class ConversionType:
     needs_subcategories: bool
     fields: tuple[str, ...]
     required: frozenset[str]
+    # Created as soon as the user's action completes valid details (Customer). Otherwise
+    # an explicit confirmation of the summary is required (B2B Client, Partners).
+    auto_create: bool = False
 
     def steps(self) -> list[str]:
         """Execution steps after confirmation, in order."""
@@ -102,7 +108,7 @@ class ConversionType:
 
 CUSTOMER = ConversionType(
     "customer", "Customer", "create_customer", "Customer", 1, False, False, False,
-    CUSTOMER_FORM, frozenset({*_PERSON, *_ADDRESS_REQUIRED}),
+    CUSTOMER_FORM, frozenset({*_PERSON, *_ADDRESS_REQUIRED}), auto_create=True,
 )
 B2B_CLIENT = ConversionType(
     "b2b_client", "B2B Client (Insurance Carrier)", "create_b2b_client", "InsuranceCarrier", 4, True, True, False,
@@ -244,6 +250,9 @@ def validate_draft(
             invalid["Zipcode"] = "must be a 5-digit US ZIP code"
         elif not us and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 -]{1,9}", zipcode):
             invalid["Zipcode"] = "not a valid postal code"
+    # A browser's saved-address autofill can put the state code into County ("IL").
+    if us and (draft.get("county") or "").strip().rstrip(".").upper() in _US_STATES:
+        invalid["County"] = "must be the county name, not a state code"
     has_lat, has_lng = bool(draft.get("latitude")), bool(draft.get("longitude"))
     if "latitude" in ctype.fields and has_lat != has_lng:
         invalid["Latitude" if not has_lat else "Longitude"] = "latitude and longitude must be given together"

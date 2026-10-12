@@ -40,7 +40,12 @@ class StepFailed(Exception):
 
 
 class StepBlocked(Exception):
-    """The step cannot run yet (e.g. an API is not configured). Not a success."""
+    """The step must not go ahead (e.g. an API is not configured, or the account already
+    exists). Not a success. `update` is still applied to the state, like StepFailed."""
+
+    def __init__(self, message: str, update: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.update = update or {}
 
 
 NodeFn = Callable[[ContactUsAgentState, RunnableConfig], Awaitable[StepResult]]
@@ -65,7 +70,8 @@ def tracked_step(step_id: str, running_message: str | Callable[[ContactUsAgentSt
             except (StepBlocked, CustomerApiNotConfiguredError) as exc:
                 await emitter.step(step_id, "blocked", str(exc), duration_ms=elapsed())
                 log_step(logger, AGENT, run_id, step_id, "blocked", elapsed())
-                return {"current_step": step_id, "execution_status": "blocked", "error": str(exc)}
+                update = getattr(exc, "update", None) or {}
+                return {**update, "current_step": step_id, "execution_status": "blocked", "error": str(exc)}
             except StepFailed as exc:
                 return {**exc.update, **await _fail(emitter, run_id, step_id, str(exc), elapsed())}
             except BootogApiError as exc:

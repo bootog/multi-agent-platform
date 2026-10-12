@@ -45,6 +45,19 @@ class ChatTurnRequest(CamelModel):
     agent_key: str | None = Field(None, pattern=AGENT_KEY_PATTERN)
     # The submenu's label, used only for wording (e.g. "Request Demo").
     agent_label: str | None = Field(None, max_length=80)
+    # A chat card's structured form (address details, "Create customer").
+    form: "ChatFormSubmission | None" = None
+
+
+class ChatFormSubmission(CamelModel):
+    """A structured form submitted from a chat card, sent with (or instead of) a message.
+    The backend merges and validates it exactly like typed details."""
+
+    # submit_details: the details form; create: "Create customer" on a ready summary.
+    action: Literal["submit_details", "create"]
+    # The request the card belongs to; a form for another request is refused.
+    request_id: str = Field(..., min_length=1, max_length=64)
+    fields: dict[str, str] = Field(default_factory=dict, max_length=30)
 
 
 class ChatTurnStarted(CamelModel):

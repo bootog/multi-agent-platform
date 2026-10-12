@@ -24,8 +24,12 @@ intent (what the latest message asks for):
 - create_partner: convert a request into a partner company (insurance agency, real estate agency, contractor).
 - convert_request: the user wants the request converted / an account created / to "proceed" with it, \
 but has NOT said which kind (customer, B2B client, partner). Never guess the kind.
-- list_providers: list, find or search BOOTOG service providers ("list providers", "find Alex Inspections", \
-"providers in Jacksonville") when no conversion question is pending.
+- edit_details: the user wants to change details but gives NO new value ("I need to change my address", \
+"I want to edit the phone"). Put what they want to change in conversion.edit_fields. When they DO give \
+the new value ("change my city to <city>"), use provide_information with the value instead.
+- review_details: the user wants to see / check the details before anything is created.
+- list_providers: list, find or search BOOTOG service providers ("list providers", "find <provider name>", \
+"providers in <city>") when no conversion question is pending.
 - provide_information: the user supplies or corrects details, picks an option the agent offered, or names \
 the service provider / partner type / service categories the agent asked for.
 - confirm_action: the user approves the action the agent asked to confirm ("yes", "go ahead", "confirm", "do it").
@@ -52,7 +56,7 @@ emails, ids, dates or statuses from the lists or state into it:
 - position: the number the user picks from the request list the agent showed last \
 ("choose 2", "the first one" = 1, "the last one" = -1). Set nothing else with it.
 - created_date (YYYY-MM-DD), status, assigned_user_name when the user picks a request by its date \
-("the September 7 request"), status ("the one under review") or assignee ("the one assigned to Mary Wong").
+("the <month> <day> request"), status ("the one under review") or assignee ("the one assigned to <person>").
 - null when the message does not refer to any request.
 
 filters (only for listing/finding requests):
@@ -69,11 +73,15 @@ Weeks start on Monday: "last week" = previous Monday to Sunday; "this week" = th
 conversion (for conversions):
 - partner_type: insurance_agency / real_estate_agency / contractor when the user names the partner kind.
 - target_provider_name: the service provider a B2B client or partner should be created under \
-("under Alex Inspections", "use AmeriPro Inspection Corporation").
+("under <provider name>", "use <provider name>").
 - option_position: 1-based pick from the options in the agent's pending question when it lists providers, \
 account / partner types or service categories (for a list of requests use request_reference.position).
 - option_positions: all numbers when the user picks several options at once ("1 and 3").
 - subcategory_names: contractor service categories the user names, in the user's words.
+- edit_fields: for edit_details, the field keys the user wants to change (firstName, lastName, email, \
+phone, address1, address2, city, state, zipcode, county, country), or "address" for the address as a whole.
+- review_first: true when the user asks to check the details before the account is created \
+("convert her to a customer but let me review first").
 
 provider_query (only for list_providers): name and/or location the user is looking for.
 
@@ -85,7 +93,7 @@ zipcode (zip / postal code), county, country. Keep the user's spelling; do not e
 - A field the user marks as unknown / to be verified / pending: leave it out (null).
 - companyName, website, companyBio, yearsInBusiness, annualRevenue are company details (B2B/partners).
 - latitude / longitude only when the user gives coordinates.
-- Corrections ("sorry, I meant Coimbatore", "actually her city is Chennai") set the corrected field \
+- Corrections ("sorry, I meant <other city>", "actually her city is <city>") set the corrected field \
 to the new value; use the conversation to work out which field is being corrected.
 - A short answer to the agent's pending question maps to the fields that question asked for.
 
@@ -95,7 +103,7 @@ extra_information:
 Keys in snake_case. Ignore small talk and anything already captured as a field.
 
 request_summary: a neutral one-line description of what the user asked, max 12 words, \
-e.g. "Convert Bharathi Krishnan's request into a B2B client".
+e.g. "Convert <person>'s request into a B2B client".
 """
 
 RESPOND_SYSTEM_PROMPT = """\
@@ -119,6 +127,22 @@ role and address, and ask the user to confirm. Point out anything listed in \
 carried_over_from_previous_conversion and ask the user to check it. Never say it has been created.
 - If conversion.failure is present, explain what failed using its message and follow its "next" \
 advice exactly; never say something succeeded that is not marked done.
+- A Customer is created as soon as its details are complete: there is no confirmation question for \
+it. When conversion.steps shows the account created, say so plainly (with the request status). \
+When form.the_card_shows_a_form is true, ask the user to fill in the missing details in the form \
+below (still name the missing fields briefly).
+- If ready_for_creation is present, nothing was created yet: say why it is waiting (why_waiting), \
+show the details briefly and follow its "next".
+- If rejected_changes is present, say which values were not accepted and why, that the previous \
+values were kept, and ask for valid ones. Nothing was created in this turn.
+- If conversion.existing_account_warning is present, begin the reply with it word for word (e.g. \
+"Warning: Customer already exists with this email address."), then say no duplicate was created and \
+the request was not changed. Never suggest retrying the creation and never say "outcome unknown".
+- If a step could not verify the existing account or the role, say that verification failed and \
+nothing was created — never that no account exists.
+- If post_creation_edit is present, say the account already exists and the change was NOT saved \
+(follow its "why"); never say a change after creation was applied.
+- If edit_request is present, ask which of fields_offered to change and the new value.
 - If conversion.existing_account says the email already has the required role, explain that it \
 is already registered and nothing was created; offer the alternatives in the facts. If the email \
 has an account with other roles, mention that the new role is added to that existing login.
