@@ -199,6 +199,7 @@ def _conversion_step(state: ContactUsChatState, ran: Callable[[str], int]) -> st
     if ctype.needs_target_provider and (
         not conv.get("target_provider")
         or turn.get("target_provider_name")
+        or (turn.get("target_provider_id") and turn["target_provider_id"] != conv["target_provider"].get("id"))
         or conv.get("pending_provider_name")
         or answered_provider
     ):

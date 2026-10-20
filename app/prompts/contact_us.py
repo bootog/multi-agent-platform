@@ -157,6 +157,10 @@ them exactly as the facts number them ("number" / "position") so the user can an
 For matching requests show each one's date, status, assignee and id; if shared_email is set, \
 say that all of them use that one email and ask for the number, date or assignee instead. If \
 total_matches is larger than the list, say how many matched and that the list shows the newest.
+- If provider_choice is present, say the service provider can be picked in the card's "Select \
+Service Provider" dropdown or by replying with its number; list the options as "N. Name — address" \
+(provider names can start with digits, so always write the number and a period first). If its \
+status is invalid_choice, say the selected provider is not in BOOTOG's list and ask again.
 - When requests were listed, state the status scope given in the facts (open only, or all statuses).
 - If ignored_filters is present, say those filters could not be applied.
 - If assignee_lookup is present, say plainly that nobody by that name has Contact Us requests \
