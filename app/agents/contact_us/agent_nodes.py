@@ -110,9 +110,10 @@ class ChatEmitter(RunEmitter):
     activityId, since a step can run more than once per turn) and remembers how
     each step ended."""
 
-    def __init__(self, channel: RunChannel):
+    def __init__(self, channel: RunChannel, titles: dict[str, str] | None = None):
         super().__init__(channel)
         self.outcomes: list[tuple[str, str]] = []
+        self._titles = ACTIVITY_TITLES if titles is None else titles
         self._seq: dict[str, int] = {}
         self._open: set[str] = set()
 
@@ -135,7 +136,7 @@ class ChatEmitter(RunEmitter):
             "type": "step",
             "step": step,
             "activityId": f"{step}-{self._seq[step]}",
-            "title": ACTIVITY_TITLES.get(step, step.replace("_", " ").title()),
+            "title": self._titles.get(step, step.replace("_", " ").title()),
             "status": status,
             "message": message,
         }

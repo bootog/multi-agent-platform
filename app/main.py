@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes.contact_us import router as contact_us_router
 from app.api.routes.frontorder_enquiry import router as frontorder_enquiry_router
 from app.api.routes.contact_us_history import router as contact_us_history_router
+from app.api.routes.scheduling import router as scheduling_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.history import history_store
@@ -39,6 +40,7 @@ app.include_router(agents_router, prefix="/api/v1")
 app.include_router(contact_us_router, prefix="/api/v1")
 app.include_router(frontorder_enquiry_router, prefix="/api/v1")
 app.include_router(contact_us_history_router, prefix="/api/v1")
+app.include_router(scheduling_router, prefix="/api/v1")
 
 
 @app.get("/health")
