@@ -586,6 +586,11 @@ def _understand_form(state: ContactUsChatState, form: dict[str, Any]) -> StepRes
         for key, value in _form_coordinates(form.get("fields") or {}).items():
             if value != str(current.get(key) or ""):
                 fields[key] = value
+    provider_id = (form.get("fields") or {}).get(PROVIDER_FORM_KEY)
+    current_provider = (conversion_of(state).get("target_provider") or {}).get("id")
+    if ctype.needs_target_provider and isinstance(provider_id, str) and provider_id.strip() and provider_id.strip() != current_provider:
+        # Checked against BOOTOG's provider list in resolve_target_provider; never trusted as is.
+        update["turn_conversion"] = {"target_provider_id": provider_id.strip()[:64]}
     create = form.get("action") == "create"
     operation = state.get("operation") if state.get("operation") in CONVERSION_OPERATIONS else ctype.operation
     update.update(
@@ -596,7 +601,8 @@ def _understand_form(state: ContactUsChatState, form: dict[str, Any]) -> StepRes
         form_submitted=True,
         explicit_create=create,
     )
-    label = "Create requested" if create else (f"Details submitted: {', '.join(FIELD_LABELS[k] for k in fields)}" if fields else "Details submitted (no changes)")
+    changed = [FIELD_LABELS[k] for k in fields] + (["Service Provider"] if update.get("turn_conversion") else [])
+    label = "Create requested" if create else (f"Details submitted: {', '.join(changed)}" if changed else "Details submitted (no changes)")
     return StepResult(label, update, data={"form": form.get("action"), "fields": list(fields)})
 
 
@@ -951,6 +957,14 @@ def creation_status(state: ContactUsChatState) -> dict[str, Any]:
 
 
 _NOT_TYPED = ("latitude", "longitude")  # never typed in: from the request only
+# Form key of the card's "Select Service Provider" (B2B / Partners); the value is a provider id.
+PROVIDER_FORM_KEY = "targetProviderId"
+PROVIDER_LABEL = "Service Provider"
+
+
+def provider_missing(state: ContactUsChatState) -> bool:
+    ctype = active_type(state)
+    return bool(ctype and ctype.needs_target_provider and not conversion_of(state).get("target_provider"))
 
 
 def conversion_state(state: ContactUsChatState, missing: list[str], invalid: dict[str, str]) -> str:
@@ -1005,6 +1019,11 @@ def customer_view(state: ContactUsChatState) -> dict[str, Any] | None:
     errors = {**invalid, **(state.get("rejected_field_updates") or {})}
     user_fields = state.get("user_customer_fields") or {}
     conv = conversion_of(state)
+    if conv.get("request_id") != (state.get("contact_request") or {}).get("id"):
+        conv = {}
+    # The service provider is required like a field: nothing is "ready" without it.
+    if provider_missing(state) and conv:
+        missing = [PROVIDER_LABEL, *missing]
     status = conversion_state(state, missing, errors)
     editable = not account_exists(state) and status not in ("completed", "status_pending", "partial")
     problem_keys = {k for k in ctype.fields if FIELD_LABELS[k] in missing or FIELD_LABELS[k] in errors}
@@ -1027,12 +1046,29 @@ def customer_view(state: ContactUsChatState) -> dict[str, Any] | None:
             "level": "warning",
             "text": "The existing-account check could not be completed, so the account was not created. Please try again.",
         }
+    provider_field = None
+    if ctype.needs_target_provider:
+        chosen = conv.get("target_provider")
+        rejected = (state.get("pending_question") or {}).get("status") == "invalid_choice"
+        provider_field = {
+            "key": PROVIDER_FORM_KEY,
+            "label": PROVIDER_LABEL,
+            "required": True,
+            "value": {"id": chosen["id"], "name": chosen["name"]} if chosen else None,
+            "status": "valid" if chosen else "missing",
+            "error": "Choose a provider from the list" if rejected else None,
+            # Only while it can still be chosen or changed; ids come from SearchProviders.
+            "options": [{"id": p["id"], "name": p["name"], "address": p.get("address")}
+                        for p in conv.get("provider_options") or []] if editable else [],
+            "optionsTruncated": bool(conv.get("provider_options_truncated")),
+        }
     return {
         "requestId": record.get("id"),
         "notice": notice,
         "conversionType": ctype.key,
         "conversionLabel": ctype.label,
         "serviceProvider": (conv.get("target_provider") or {}).get("name"),
+        "serviceProviderField": provider_field,
         "state": status,
         "editable": editable,
         # Inputs the card opens with (missing/invalid details plus the whole address);
@@ -1154,6 +1190,8 @@ def _conversion_facts(state: ContactUsChatState) -> dict[str, Any] | None:
                 {"position": i + 1, "name": p["name"], "address": p.get("address")}
                 for i, p in enumerate(conv.get("provider_candidates") or [])
             ],
+            "card": "The details card has a 'Select Service Provider' dropdown with every provider; the user can "
+            "pick it there (together with any missing details) or reply with a number or a provider name.",
         }
     if question == "choose_subcategory":
         facts["service_category_choice"] = {

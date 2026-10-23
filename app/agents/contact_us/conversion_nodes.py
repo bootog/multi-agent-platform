@@ -262,6 +262,10 @@ async def find_providers(config: RunnableConfig, name: str | None, location: str
     return providers, truncated
 
 
+def _provider_option(p: dict[str, Any]) -> dict[str, Any]:
+    return {"id": p["id"], "name": p["name"], "address": p.get("address")}
+
+
 @tracked_step("resolve_target_provider", "Finding the service provider", "Unable to look up service providers.")
 async def resolve_target_provider(state: ContactUsChatState, config: RunnableConfig) -> StepResult:
     conv = conversion_of(state)
@@ -269,10 +273,27 @@ async def resolve_target_provider(state: ContactUsChatState, config: RunnableCon
     candidates = conv.get("provider_candidates") or []
     pos = turn.get("option_position") if _answered(state, "choose_provider") else None
     name = (turn.get("target_provider_name") or conv.get("pending_provider_name") or "").strip()
+    picked_id = turn.get("target_provider_id")
     conv["pending_provider_name"] = None
+    if not conv.get("provider_options"):
+        # The details card's "Select Service Provider" list (SearchProviders, every page,
+        # bounded), loaded once per conversion like the host's B2B / Partner screens.
+        everything = await search_service_providers.ainvoke({"all_pages": True}, config=config)
+        conv["provider_options"] = [_provider_option(p) for p in everything["providers"]]
+        conv["provider_options_truncated"] = everything["truncated"]
+    options_all = conv["provider_options"]
 
     chosen = None
-    if pos and candidates and 1 <= pos <= len(candidates):
+    if picked_id:
+        # Picked in the card: only an id from the list BOOTOG returned is accepted.
+        chosen = next((p for p in [*options_all, *candidates] if p["id"] == picked_id), None)
+        if chosen is None:
+            conv["provider_candidates"] = options_all[:_OPTION_LIMIT]
+            return StepResult(
+                "The selected service provider is not in BOOTOG's provider list — asking again",
+                _waiting({"conversion": conv}, {"type": "choose_provider", "status": "invalid_choice"}),
+            )
+    elif pos and candidates and 1 <= pos <= len(candidates):
         chosen = candidates[pos - 1]
     elif name:
         found, truncated = await find_providers(config, name, None)
@@ -281,7 +302,7 @@ async def resolve_target_provider(state: ContactUsChatState, config: RunnableCon
             chosen = (exact or found)[0]
         else:
             options = (exact or found)[:_OPTION_LIMIT]
-            conv["provider_candidates"] = [{"id": p["id"], "name": p["name"], "address": p.get("address")} for p in options]
+            conv["provider_candidates"] = [_provider_option(p) for p in options]
             status = "ambiguous" if options else "not_found"
             question = {"type": "choose_provider", "status": status, "requested": name, "more": len(found) > len(options)}
             return StepResult(
@@ -290,10 +311,8 @@ async def resolve_target_provider(state: ContactUsChatState, config: RunnableCon
                 data={"matches": len(found), "truncated": truncated},
             )
     if chosen is None:
-        # Nothing named yet: ask, offering the first providers as examples.
-        first = await search_service_providers.ainvoke({"all_pages": False}, config=config)
-        options = first["providers"][:_OPTION_LIMIT]
-        conv["provider_candidates"] = [{"id": p["id"], "name": p["name"], "address": p.get("address")} for p in options]
+        # Nothing named yet: ask (the card offers every provider; the chat the first few).
+        conv["provider_candidates"] = options_all[:_OPTION_LIMIT]
         return StepResult(
             "Asking which service provider to use",
             _waiting({"conversion": conv}, {"type": "choose_provider", "status": "needed"}),
