@@ -26,6 +26,19 @@ def _client(config: RunnableConfig) -> BootogClient:
     return config["configurable"]["bootog_client"]
 
 
+# Requests per page of a chat list: the cards the chat shows at once. The first page reads
+# `contact_us_page_size` (also used to match requests by name); later pages read exactly
+# this many, so page N always continues where page N-1 ended.
+LIST_PAGE_SIZE = 25
+# History entries read per request. The Contact Us screen asks for 100000 (everything); a
+# request's history is short, and a longer one is reported as cut off instead.
+HISTORY_PAGE_SIZE = 200
+
+
+def list_page_size() -> int:
+    return max(1, min(get_settings().contact_us_page_size, LIST_PAGE_SIZE))
+
+
 @tool
 async def get_provider_list(config: RunnableConfig) -> list[dict[str, str]]:
     """List the companies (providers) available to the current Bootog session."""
@@ -46,12 +59,14 @@ async def get_contact_us_requests(
     all_statuses: bool = False,
     assigned_user_ids: list[str] | None = None,
     request_id: str | None = None,
+    page: int = 1,
 ) -> dict[str, Any]:
     """Retrieve Contact Us requests, newest first. Without a name/email: the latest page
-    (open requests unless `statuses` or `all_statuses` is given). With a name and/or
-    email: a server-side search across every page (bounded; `truncated` says if the bound
-    was hit). `request_id`: that one request, whatever its status. `module_filter` scopes
-    the records to one Contact module (default: Contact-Us)."""
+    (open requests unless `statuses` or `all_statuses` is given); `page` > 1 continues the
+    list one chat page (`list_page_size()`) at a time. With a name and/or email: a
+    server-side search across every page (bounded; `truncated` says if the bound was hit).
+    `request_id`: that one request, whatever its status. `module_filter` scopes the
+    records to one Contact module (default: Contact-Us)."""
     settings = get_settings()
     api = ContactUsApi(_client(config))
     filters = {
@@ -64,15 +79,33 @@ async def get_contact_us_requests(
         "assigned_user_ids": assigned_user_ids,
     }
     if request_id:
-        page = await api.list_requests(page_size=5, request_id=request_id, **{**filters, "all_statuses": True})
-        return {"total": page.total, "records": page.records, "truncated": False, "search": True}
+        result = await api.list_requests(page_size=5, request_id=request_id, **{**filters, "all_statuses": True})
+        return {"total": result.total, "records": result.records, "truncated": False, "search": True}
     if contact_name or email:
-        page = await api.search_requests(
+        result = await api.search_requests(
             settings.contact_us_page_size, settings.bootog_max_pages, name=contact_name, email=email, **filters
         )
-        return {"total": page.total, "records": page.records, "truncated": page.truncated, "search": True}
-    page = await api.list_requests(page_size=settings.contact_us_page_size, **filters)
-    return {"total": page.total, "records": page.records, "truncated": False, "search": False}
+        return {"total": result.total, "records": result.records, "truncated": result.truncated, "search": True}
+    if page > 1:
+        result = await api.list_requests(page=page, page_size=list_page_size(), **filters)
+    else:
+        result = await api.list_requests(page_size=settings.contact_us_page_size, **filters)
+    return {"total": result.total, "records": result.records, "truncated": False, "search": False, "page": page}
+
+
+@tool
+async def get_contact_us_history(config: RunnableConfig, contact_us_id: str) -> dict[str, Any]:
+    """Tracking history (status changes, comments, follow-ups) of one Contact Us request, newest first."""
+    total, entries = await ContactUsApi(_client(config)).tracking_history(contact_us_id, HISTORY_PAGE_SIZE)
+    return {"total": total, "entries": entries, "truncated": total > len(entries)}
+
+
+@tool
+async def change_contact_us_status(
+    config: RunnableConfig, request_ids: list[str], status: int, comments: str | None = None
+) -> list[str]:
+    """Change the status of Contact Us requests (with an optional comment); -> the ids changed."""
+    return await ContactUsApi(_client(config)).change_status(request_ids, status, comments)
 
 
 @tool
@@ -125,9 +158,15 @@ async def get_accounts_by_email(config: RunnableConfig, email: str) -> list[dict
             "userName": a.user_name,
             # Active roles only: a deleted role (isDelete) is not an existing role.
             "roles": [
-                {"providerId": r.provider_id, "providerName": r.provider_name, "roleName": r.role_name}
+                {"providerId": r.provider_id, "providerName": r.provider_name, "roleName": r.role_name, "roleId": r.role_id}
                 for r in a.roles
                 if r.active
+            ],
+            # Deleted roles, kept apart: BOOTOG's AddVendorUser still refuses to add them again.
+            "removedRoles": [
+                {"providerId": r.provider_id, "providerName": r.provider_name, "roleName": r.role_name, "roleId": r.role_id}
+                for r in a.roles
+                if not r.active
             ],
         }
         for a in accounts
@@ -172,6 +211,8 @@ CONTACT_US_TOOLS = [
     get_contact_us_requests,
     get_contact_us_assigned_users,
     mark_contact_request_converted,
+    get_contact_us_history,
+    change_contact_us_status,
     search_service_providers,
     link_vendor_to_provider,
     get_accounts_by_email,

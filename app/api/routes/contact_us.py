@@ -98,10 +98,15 @@ async def send_contact_us_chat_message(
     form = request.form.model_dump(by_alias=False) if request.form else None
     if form and not message:
         # A form turn is a user action, never "Run Agent": give the transcript a line for it.
-        message = "Create the customer" if form["action"] == "create" else "Submitted the details form"
+        message = {
+            "create": "Create the customer", "apply_filters": "Applied the list filters", "status_change": "Status change",
+        }.get(
+            form["action"], "Submitted the details form"
+        )
     channel = registry.create("contact-us")
     turn = start_turn_task(
-        channel, session_id, message, BootogClient(auth), request.agent_key, request.agent_label, form=form
+        channel, session_id, message, BootogClient(auth), request.agent_key, request.agent_label, form=form,
+        viewer_user_id=request.viewer_user_id,
     )
     registry.track(turn)
     registry.track(record_turn(turn, channel, session_id, owner, agent, message))
@@ -133,3 +138,14 @@ async def stream_run_events(run_id: str) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+
+
+@router.get("/health/live")
+async def health_check_live():
+    return {"status": "ok"}
+
+@router.get("/health/ready")
+async def health_check_ready():
+    return {"status": "ok"}

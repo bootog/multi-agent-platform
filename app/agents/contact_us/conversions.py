@@ -21,6 +21,8 @@ account (Auth0 forces a change at first login). It is never stored, logged or sh
 
 Adding a conversion type = one more ConversionType entry; the graph is generic."""
 
+import base64
+import binascii
 import hashlib
 import json
 import re
@@ -94,6 +96,8 @@ class ConversionType:
     # Created as soon as the user's action completes valid details (Customer). Otherwise
     # an explicit confirmation of the summary is required (B2B Client, Partners).
     auto_create: bool = False
+    # Optional images the form takes (UPLOAD_SPECS keys), sent with AddVendorUser.
+    uploads: tuple[str, ...] = ()
 
     def steps(self) -> list[str]:
         """Execution steps after confirmation, in order."""
@@ -114,17 +118,26 @@ B2B_CLIENT = ConversionType(
     "b2b_client", "B2B Client (Insurance Carrier)", "create_b2b_client", "InsuranceCarrier", 4, True, True, False,
     COMPANY_FORM, frozenset({"companyName", *_PERSON, *_ADDRESS_REQUIRED}),
 )
+_PARTNER_REQUIRED = frozenset({"companyName", *_PERSON, *_ADDRESS_REQUIRED})
+_PARTNER_UPLOADS = ("logo", "headshot")  # the partner screen's Company Logo / User Headshot
 INSURANCE_AGENCY = ConversionType(
     "insurance_agency", "Partner — Insurance Agency", "create_partner", "InsuranceAgency", 2, True, True, False,
-    COMPANY_FORM, frozenset({"companyName", *_PERSON, *_ADDRESS_REQUIRED}),
+    COMPANY_FORM, _PARTNER_REQUIRED, uploads=_PARTNER_UPLOADS,
 )
 REAL_ESTATE_AGENCY = ConversionType(
     "real_estate_agency", "Partner — Real Estate Agency", "create_partner", "RealEstateCompany", 3, True, True, False,
-    COMPANY_FORM, frozenset({"companyName", *_PERSON, *_ADDRESS_REQUIRED}),
+    COMPANY_FORM, _PARTNER_REQUIRED, uploads=_PARTNER_UPLOADS,
 )
 CONTRACTOR = ConversionType(
     "contractor", "Partner — Contractor", "create_partner", "Contractor", 5, True, True, True,
-    COMPANY_FORM, frozenset({"companyName", *_PERSON, *_ADDRESS_REQUIRED}),
+    COMPANY_FORM, _PARTNER_REQUIRED, uploads=_PARTNER_UPLOADS,
+)
+# The Partner form while its company type is still being chosen: the fields every partner
+# type shares, for the card and for details given meanwhile. Not a conversion type (not in
+# CONVERSION_TYPES, no role): nothing can be created from it.
+PARTNER_FORM = ConversionType(
+    "partner", "Partner", "create_partner", "", 0, True, False, False,
+    COMPANY_FORM, _PARTNER_REQUIRED, uploads=_PARTNER_UPLOADS,
 )
 
 CONVERSION_TYPES: dict[str, ConversionType] = {
@@ -147,6 +160,11 @@ STEP_LABELS: dict[str, str] = {
 
 def conversion_type(key: str | None) -> ConversionType | None:
     return CONVERSION_TYPES.get(key or "")
+
+
+def partner_type_name(ctype: ConversionType) -> str:
+    """"Contractor" for "Partner — Contractor": the company type as the partner screen names it."""
+    return ctype.label.removeprefix("Partner — ")
 
 
 def all_field_keys() -> list[str]:
@@ -360,6 +378,70 @@ def build_vendor_user_form(
         "Latitude": draft.get("latitude") or "",
         "Longitude": draft.get("longitude") or "",
     }
+
+
+# --- uploads ---------------------------------------------------------------------------
+# Company Logo / User Headshot. The host app has no separate upload call: createNewUser
+# attaches them to the AddVendorUser FormData itself ("LogoFile.FormFile" +
+# "LogoFile.Encrypted", "HeadshotFile.FormFile" + "HeadshotFile.Encrypted"), and BOOTOG
+# stores them; `fileUrl` stays "" either way. The host accepts .jpeg/.jpg/.png. The size
+# cap is this agent's own: an image is held in the conversation until the account is
+# created, then only its name and size are kept.
+
+
+@dataclass(frozen=True)
+class UploadSpec:
+    key: str
+    label: str
+    form_name: str  # AddVendorUser multipart prefix
+
+
+UPLOAD_SPECS: dict[str, UploadSpec] = {
+    u.key: u for u in [UploadSpec("logo", "Company Logo", "LogoFile"), UploadSpec("headshot", "User Headshot", "HeadshotFile")]
+}
+UPLOAD_MAX_BYTES = 2 * 1024 * 1024
+UPLOAD_EXTENSIONS = ("jpg", "jpeg", "png")
+# The type is read from the content, never taken from the name or the browser.
+_IMAGE_SIGNATURES = {b"\xff\xd8\xff": "image/jpeg", b"\x89PNG\r\n\x1a\n": "image/png"}
+
+
+def read_upload(value: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """A submitted image ({name, data: base64}) -> (stored upload, None) or (None, why not)."""
+    name = " ".join(str(value.get("name") or "").replace("\\", "/").rsplit("/", 1)[-1].split())[:120]
+    if name.rsplit(".", 1)[-1].casefold() not in UPLOAD_EXTENSIONS or "." not in name:
+        return None, "must be a .jpg, .jpeg or .png image"
+    try:
+        data = base64.b64decode(str(value.get("data") or ""), validate=True)
+    except (binascii.Error, ValueError):
+        return None, "could not be read"
+    if not data:
+        return None, "is empty"
+    if len(data) > UPLOAD_MAX_BYTES:
+        return None, f"must be {UPLOAD_MAX_BYTES // (1024 * 1024)} MB or smaller"
+    content_type = next((t for sig, t in _IMAGE_SIGNATURES.items() if data.startswith(sig)), None)
+    if content_type is None:
+        return None, "is not a JPEG or PNG image"
+    return {
+        "name": name,
+        "content_type": content_type,
+        "size": len(data),
+        "sha": hashlib.sha256(data).hexdigest()[:24],
+        "data": base64.b64encode(data).decode(),
+    }, None
+
+
+def vendor_user_uploads(uploads: dict[str, dict[str, Any]]) -> tuple[dict[str, str], dict[str, tuple[str, bytes, str]]]:
+    """-> (extra AddVendorUser fields, file parts), as createNewUser appends them. Uploads
+    without content (already sent) are skipped."""
+    fields: dict[str, str] = {}
+    files: dict[str, tuple[str, bytes, str]] = {}
+    for key, upload in uploads.items():
+        spec = UPLOAD_SPECS.get(key)
+        if spec is None or not upload.get("data"):
+            continue
+        files[f"{spec.form_name}.FormFile"] = (upload["name"], base64.b64decode(upload["data"]), upload["content_type"])
+        fields[f"{spec.form_name}.Encrypted"] = "false"
+    return fields, files
 
 
 _SPECIALS = "@#$%&"

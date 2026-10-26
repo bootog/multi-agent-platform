@@ -39,3 +39,14 @@ async def start_frontorder_enquiry_run(
     client = BootogClient(_auth(authorization, x_tenant_id, x_role_id, x_device_id))
     registry.track(asyncio.create_task(run_frontorder_enquiry_agent(channel, client)))
     return RunStarted(run_id=channel.run_id, steps=plan())
+
+
+
+
+@router.get("/health/live")
+async def health_check_live():
+    return {"status": "ok"}
+
+@router.get("/health/ready")
+async def health_check_ready():
+    return {"status": "ok"}

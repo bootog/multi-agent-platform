@@ -142,9 +142,13 @@ class BootogClient:
     async def post(self, path: str, json: Any = None) -> Any:
         return await self._write("POST", path, json=json)
 
-    async def post_form(self, path: str, fields: dict[str, Any]) -> Any:
-        """multipart/form-data, as the host app's FormData posts. Never retried."""
-        parts = {key: (None, _form_value(value)) for key, value in fields.items()}
+    async def post_form(
+        self, path: str, fields: dict[str, Any], files: dict[str, tuple[str, bytes, str]] | None = None
+    ) -> Any:
+        """multipart/form-data, as the host app's FormData posts; `files`: part name ->
+        (filename, content, content type). Never retried."""
+        parts: dict[str, Any] = {key: (None, _form_value(value)) for key, value in fields.items()}
+        parts.update(files or {})
         return await self._write("POST", path, files=parts)
 
     async def put(self, path: str, json: Any = None) -> Any:

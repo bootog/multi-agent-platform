@@ -15,7 +15,7 @@ from the user; the next message continues from the same saved state.
           -> conversion (Customer / B2B Client / Partner):
                start_conversion -> [choose_conversion_type] -> [resolve_target_provider]
                -> validate_customer_data ── missing/invalid -> ask_for_missing (waits)
-               -> check_existing_account -> resolve_role -> [select_subcategories]
+               -> resolve_role -> check_existing_account -> [select_subcategories]
                -> confirm_conversion (waits for an explicit "yes")
                -> create_account -> verify_account -> [link_provider_vendor]
                -> [save_subcategories] -> update_request_status -> refresh_requests
@@ -38,20 +38,29 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from app.agents.contact_us import agent_nodes, conversion_nodes, nodes
+from app.agents.contact_us import agent_nodes, conversion_nodes, nodes, request_actions
 from app.agents.contact_us.agent_nodes import (
     REFERENCE_KEYS,
     ChatEmitter,
     customer_view,
     listed_records,
     listed_this_turn,
+    provider_catalog_stale,
+    request_filters_view,
     request_summary,
 )
-from app.agents.contact_us.conversion_nodes import active_type, conversion_fingerprint, conversion_of
+from app.agents.contact_us.conversion_nodes import active_type, conversion_fingerprint, conversion_of, conversion_steps
 from app.agents.contact_us.conversions import CONVERSION_OPERATIONS
 from app.agents.contact_us.modules import agent_name, canonical_agent_key, module_filter
+from app.agents.contact_us.request_actions import status_change_view
 from app.agents.contact_us.state import ContactUsChatState
-from app.agents.contact_us.understanding import ADVANCING_INTENTS, CONVERSION_INTENTS, REQUEST_INTENTS, WORKFLOW_INTENTS
+from app.agents.contact_us.understanding import (
+    ADVANCING_INTENTS,
+    CONVERSION_INTENTS,
+    REQUEST_ACTION_INTENTS,
+    REQUEST_INTENTS,
+    WORKFLOW_INTENTS,
+)
 from app.agents.runtime import RunChannel
 from app.core.logging import get_logger
 from app.integrations.bootog import BootogClient
@@ -65,6 +74,10 @@ NODES: dict[str, NodeFn] = {
     "resolve_provider": agent_nodes.resolve_provider,
     "search_providers": conversion_nodes.search_providers,
     "resolve_assigned_user": conversion_nodes.resolve_assigned_user,
+    "load_filter_options": agent_nodes.load_filter_options,
+    "get_tracking_history": request_actions.get_tracking_history,
+    "prepare_status_change": request_actions.prepare_status_change,
+    "change_request_status": request_actions.change_request_status,
     "get_contact_us_data": nodes.get_contact_us_data,
     "match_request": agent_nodes.match_request,
     "select_contact_request": nodes.select_contact_request,
@@ -106,23 +119,35 @@ def next_step(state: ContactUsChatState) -> str:
     if state.get("execution_status") in ("failed", "blocked"):
         return "respond"
     if state.get("kickoff"):  # "Run Agent": load the latest requests and greet
-        return "get_contact_us_data" if not ran("get_contact_us_data") else "respond"
+        return "get_contact_us_data" if not ran("get_contact_us_data") else _filter_options(state, ran)
     if not ran("understand_message"):
         return "understand_message"
-    if state.get("company_name") and not ran("resolve_provider"):
+    if (state.get("company_name") or state.get("company_pick")) and not ran("resolve_provider"):
         return "resolve_provider"
+
+    if state.get("status_change_confirmed"):
+        # The pending status change, confirmed this turn (change_request_status checks it
+        # again), then the changed request's history.
+        if not ran("change_request_status"):
+            return "change_request_status"
+        change = state.get("status_change") or {}
+        if len(change.get("changed") or []) == 1 and not ran("get_tracking_history"):
+            return "get_tracking_history"
+        return "respond"
 
     intent = state.get("intent")
     if intent == "list_providers":
         return "search_providers" if not ran("search_providers") else "respond"
     if intent == "list_requests":
+        if state.get("filter_problems"):
+            return "respond"  # a filter could not be applied (or the company is unclear): ask, list nothing
         filters = state.get("request_filters") or {}
-        if filters.get("assigned_user_name"):
+        if filters.get("assigned_user_name") or filters.get("assigned_to_me"):
             if not ran("resolve_assigned_user"):
                 return "resolve_assigned_user"
             if not filters.get("assigned_user_ids"):
                 return "respond"  # unknown assignee: ask, never list everyone instead
-        return "get_contact_us_data" if not ran("get_contact_us_data") else "respond"
+        return "get_contact_us_data" if not ran("get_contact_us_data") else _filter_options(state, ran)
     if intent not in WORKFLOW_INTENTS:
         return "respond"
 
@@ -130,9 +155,23 @@ def next_step(state: ContactUsChatState) -> str:
     ref = state.get("request_reference") or {}
     identifying = any(ref.get(k) for k in REFERENCE_KEYS)
     match = state.get("match_result") or {}
+    # A partner needs no Contact Us request (the host's create-partner screen doesn't): with
+    # none selected and none named, it is created on its own instead of asking for one.
+    standalone_partner = (
+        state.get("operation") == "create_partner" and not state.get("contact_request") and not identifying
+    )
+    # A status change naming list numbers has its request ids already; none means a number
+    # was not in the list: nothing is prepared (never another request instead).
+    targets = state.get("status_targets") if intent == "change_status" else None
+    if targets is not None:
+        if not targets:
+            return "respond"
+        return "prepare_status_change" if not ran("prepare_status_change") else "respond"
 
     # Which request? Retrieve first if nothing suitable is loaded.
-    if identifying or (not state.get("contact_request") and (intent in REQUEST_INTENTS or converting)):
+    if identifying or (
+        not state.get("contact_request") and (intent in REQUEST_INTENTS or converting) and not standalone_partner
+    ):
         if identifying and not ran("get_contact_us_data") and (
             not state.get("contact_requests") or state.get("request_filters")
         ):
@@ -159,8 +198,12 @@ def next_step(state: ContactUsChatState) -> str:
     if _unmerged(state, ran):
         return "merge_customer_fields"
 
+    if intent in REQUEST_ACTION_INTENTS and state.get("contact_request"):
+        step = "get_tracking_history" if intent == "show_history" else "prepare_status_change"
+        return step if not ran(step) else "respond"
+
     # A conversion only advances when the user is working on it this turn.
-    if not (converting and state.get("contact_request") and intent in ADVANCING_INTENTS):
+    if not (converting and (state.get("contact_request") or standalone_partner) and intent in ADVANCING_INTENTS):
         return "respond"
     return _conversion_step(state, ran)
 
@@ -182,7 +225,7 @@ def _conversion_step(state: ContactUsChatState, ran: Callable[[str], int]) -> st
         continuing = ran("create_account") or intent in ("retry_operation", "confirm_action", *CONVERSION_INTENTS)
         if not continuing:
             return "respond"
-        for step in ctype.steps():
+        for step in conversion_steps(ctype, conv):
             if step not in completed:
                 return step if not ran(step) else "respond"
         if ran("update_request_status") and not ran("refresh_requests"):
@@ -211,12 +254,13 @@ def _conversion_step(state: ContactUsChatState, ran: Callable[[str], int]) -> st
         return "validate_customer_data"
     if state.get("missing_required_fields") or state.get("invalid_fields"):
         return "ask_for_missing" if not ran("ask_for_missing") else "respond"
+    if not conv.get("role_id"):
+        # First: the existing-account check compares role ids, as BOOTOG's duplicate check does.
+        return "resolve_role" if not ran("resolve_role") else "respond"
     if not ran("check_existing_account"):
         # Every advancing turn: the email may have changed, or an earlier attempt's
         # account may have appeared (then it is adopted, never created again).
         return "check_existing_account"
-    if not conv.get("role_id"):
-        return "resolve_role" if not ran("resolve_role") else "respond"
     if ctype.needs_subcategories:
         wants_more = (
             turn.get("subcategory_names")
@@ -255,6 +299,13 @@ def _conversion_step(state: ContactUsChatState, ran: Callable[[str], int]) -> st
     if confirmed:
         return "create_account" if not ran("create_account") else "respond"
     return "confirm_conversion" if not ran("confirm_conversion") else "respond"
+
+
+def _filter_options(state: ContactUsChatState, ran: Callable[[str], int]) -> str:
+    """After a request list: the filter card's company list, when not loaded recently."""
+    if provider_catalog_stale(state) and not ran("load_filter_options"):
+        return "load_filter_options"
+    return "respond"
 
 
 def _creation_authorized(state: ContactUsChatState, conv: dict[str, Any], fingerprint: str) -> bool:
@@ -436,6 +487,15 @@ def chat_result(state: ContactUsChatState) -> dict[str, Any]:
         "requestsTotal": state.get("contact_requests_total") if context == "listed" else None,
         "selectedRequest": request_summary(selected) if selected else None,
         "customer": customer_view(state) if show_customer else None,
+        # The filter card: with a request list, or when a list filter has to be fixed first.
+        "requestFilters": (
+            request_filters_view(state)
+            if context == "listed" or (state.get("intent") == "list_requests" and state.get("filter_problems"))
+            else None
+        ),
+        # This turn's tracking history and status change (cards); never older ones.
+        "history": state.get("history"),
+        "statusChange": status_change_view(state),
         "providers": providers or [],
         "extraInformation": state.get("extra_information") or {},
     }
@@ -451,9 +511,11 @@ async def run_contact_us_chat_turn(
     agent_key: str | None = None,
     agent_label: str | None = None,
     form: dict[str, Any] | None = None,
+    viewer_user_id: str | None = None,
 ) -> ContactUsChatState:
     """Run one turn, streaming activity into `channel`. Always closes the channel and client.
-    `form`: a chat card's structured submission ({action, request_id, fields})."""
+    `form`: a chat card's structured submission ({action, request_id, fields}).
+    `viewer_user_id`: the signed-in user's BOOTOG id ("requests assigned to me")."""
     graph = graph or CONTACT_US_CHAT_GRAPH
     emitter = ChatEmitter(channel)
     configurable: dict[str, Any] = {"thread_id": session_id, "bootog_client": client, "emitter": emitter}
@@ -470,6 +532,7 @@ async def run_contact_us_chat_turn(
         "current_user_message": message,
         "conversation_history": [{"role": "user", "content": message}] if message else [],
         "form_submission": form,
+        "viewer_user_id": viewer_user_id,
     }
     try:
         state = await graph.ainvoke(inputs, config=config)
@@ -501,10 +564,12 @@ async def run_turn_in_session(
     agent_key: str | None = None,
     agent_label: str | None = None,
     form: dict[str, Any] | None = None,
+    viewer_user_id: str | None = None,
 ) -> None:
     try:
         await run_contact_us_chat_turn(
-            channel, session_id, message, client, agent_key=agent_key, agent_label=agent_label, form=form
+            channel, session_id, message, client, agent_key=agent_key, agent_label=agent_label, form=form,
+            viewer_user_id=viewer_user_id,
         )
     finally:
         sessions.end(session_id)
@@ -518,5 +583,8 @@ def start_turn_task(
     agent_key: str | None = None,
     agent_label: str | None = None,
     form: dict[str, Any] | None = None,
+    viewer_user_id: str | None = None,
 ) -> asyncio.Task:
-    return asyncio.create_task(run_turn_in_session(channel, session_id, message, client, agent_key, agent_label, form))
+    return asyncio.create_task(
+        run_turn_in_session(channel, session_id, message, client, agent_key, agent_label, form, viewer_user_id)
+    )

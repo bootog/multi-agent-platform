@@ -21,7 +21,8 @@ intent (what the latest message asks for):
 - show_request_details: show the details of a request (usually the current one).
 - create_customer: convert a request into a Customer — ONLY when the user says customer.
 - create_b2b_client: convert a request into a B2B client / insurance carrier company.
-- create_partner: convert a request into a partner company (insurance agency, real estate agency, contractor).
+- create_partner: convert a request into a partner company (insurance agency, real estate agency, contractor), \
+or create a new partner company on its own ("add a new partner company") — a partner needs no request.
 - convert_request: the user wants the request converted / an account created / to "proceed" with it, \
 but has NOT said which kind (customer, B2B client, partner). Never guess the kind.
 - edit_details: the user wants to change details but gives NO new value ("I need to change my address", \
@@ -35,7 +36,21 @@ the service provider / partner type / service categories the agent asked for.
 - confirm_action: the user approves the action the agent asked to confirm ("yes", "go ahead", "confirm", "do it").
 - retry_operation: the user asks to retry or resume a step that failed ("try again", "retry the status update").
 - cancel_operation: the user abandons the current task ("never mind", "cancel the conversion") without asking for anything else.
+- show_history: the tracking history / contact log of a request ("show its history", "who changed the \
+status?", "what happened previously?", "previous comments", "follow-up details"). Identify the request \
+with request_reference as usual ("the second one" -> position 2; "this request" -> use_current).
+- change_status: change the status of a request ("change it to Approved", "cancel this request", "move \
+request 3 to Pending Approval"). Put the new status (and any comment the user wants recorded) in \
+status_change; the request goes in request_reference, or status_change.positions for several requests \
+of the last list ("update 1 and 3 to Under Review"). "Cancel this request" is change_status to \
+Cancelled — never cancel_operation. The agent always asks for confirmation before changing anything.
 - other: anything else.
+After a finished conversion the state's pending_question is "next_action" (the agent offered to \
+convert another request). Then: "yes", "convert another person", "show me the remaining requests" or \
+"convert the next one" -> list_requests (the user still has to pick WHICH request; never a conversion \
+by itself); a request or person the user names -> find_request, or the conversion they ask for \
+("convert Jane Doe to a customer" -> create_customer); "I want to convert a B2B customer" -> \
+create_b2b_client; "no, that's all" -> greeting_or_help with goal none.
 If the user both cancels and asks for something else ("don't create the customer, just show me the request"), \
 use the intent of what they asked for and set goal to "none". A "no" to a confirmation question is cancel_operation \
 unless the user also gives corrections (then provide_information).
@@ -51,7 +66,11 @@ request_reference — ONLY what the user's latest message itself says; never cop
 emails, ids, dates or statuses from the lists or state into it:
 - use_current=true when the user refers to the request/person already being discussed \
 ("her", "him", "this request", "that one", "the previous request") and a request is selected.
-- name / email when the user identifies a request that way.
+- name / email when the user identifies a request that way. A NEW email for the person whose \
+request is being converted ("use <email> instead", "change the email to <email>", "try <email>") \
+is NOT a request reference: it is customer_field_updates.email (intent provide_information). \
+Likewise the details of a partner being created (company name, contact person, email, phone, address) \
+are customer_field_updates, never a request reference.
 - request_id when the message contains a request id (e.g. "Use request 7b0f…"); copy it exactly.
 - position: the number the user picks from the request list the agent showed last \
 ("choose 2", "the first one" = 1, "the last one" = -1). Set nothing else with it.
@@ -67,8 +86,22 @@ Weeks start on Monday: "last week" = previous Monday to Sunday; "this week" = th
 - incomplete_only=true when the user asks for incomplete requests or requests missing information.
 - statuses: status names the user asks for (e.g. "Under Review", "Needs Clarification", "CRM Completed", "Closed").
 - assigned_user_name: the person the requests are assigned to ("assigned to Michael Rowan").
-- company_name: ONLY when the user wants to list requests belonging to a company they work with \
-("show requests for Inspection Depot"). Never use it for the provider a new account goes under.
+- company_name: ONLY when the user wants to list requests belonging to a company / service provider \
+("show requests for <company>", "change the provider to <company>"). Never use it for the provider a \
+new account goes under.
+- The list filters already active are in the state ("active_list_filters") and are KEPT automatically: \
+for a follow-up ("only approved ones", "now for October", "change the provider to X") set ONLY what \
+changes. Never repeat or drop the others yourself.
+- all_statuses=true when the user asks for every status ("show all statuses").
+- assigned_to_me=true for "my requests" / "assigned to me" (never put the user's own name in \
+assigned_user_name for that).
+- clear: the active filters the user removes — "status", "date", "company", "assignee" ("remove the date \
+filter" -> ["date"]); ["all"] when the user clears every filter / starts the list again.
+- page: "next" / "previous" for another page of the same list; page_number for a specific page \
+("show page 3"). Use intent list_requests.
+If the pending question is choose_company or choose_assignee, a number the user picks goes in \
+conversion.option_position. If it is confirm_status_change, "yes" / "go ahead" is confirm_action and \
+"no" / "don't" is cancel_operation; a different status ("make it Rejected instead") is change_status.
 
 conversion (for conversions):
 - partner_type: insurance_agency / real_estate_agency / contractor when the user names the partner kind.
@@ -135,9 +168,14 @@ below (still name the missing fields briefly).
 show the details briefly and follow its "next".
 - If rejected_changes is present, say which values were not accepted and why, that the previous \
 values were kept, and ask for valid ones. Nothing was created in this turn.
+- If conversion.result is present, the account and the CRM Completed status were both verified in \
+BOOTOG: say so plainly. If conversion.result.follow_up is present, end the reply with it word for word.
+- If conversion.verification_failed is present, say it word for word; never say the email is free or \
+that an account exists.
 - If conversion.existing_account_warning is present, begin the reply with it word for word (e.g. \
-"Warning: Customer already exists with this email address."), then say no duplicate was created and \
-the request was not changed. Never suggest retrying the creation and never say "outcome unknown".
+"Warning: A Customer account already exists for this email. No duplicate account was created."), then \
+say the request was not changed, and follow conversion.how_to_continue. Never say the request was \
+cancelled or closed by this. Never suggest retrying the creation and never say "outcome unknown".
 - If a step could not verify the existing account or the role, say that verification failed and \
 nothing was created — never that no account exists.
 - If post_creation_edit is present, say the account already exists and the change was NOT saved \
@@ -162,6 +200,17 @@ Service Provider" dropdown or by replying with its number; list the options as "
 (provider names can start with digits, so always write the number and a period first). If its \
 status is invalid_choice, say the selected provider is not in BOOTOG's list and ask again.
 - When requests were listed, state the status scope given in the facts (open only, or all statuses).
+- When requests.active_filters is present, name the filters applied (status, company, dates, \
+assignee) and the page ("page 2 of 5") in one short line; the card shows them too and lets the user \
+change them. If requests.empty is present, follow it.
+- If filters_not_applied is present, nothing was listed: say which filter could not be applied and \
+ask for a valid one; never describe results.
+- If history is present, summarize it newest first (status, who, when, comment, follow-up) in a few \
+bullets; the card shows every entry. If it has no entries say there is no history yet; if it has an \
+error, say the history could not be loaded. Never invent entries.
+- If status_change is present, follow its "next". While it awaits confirmation, state exactly which \
+request(s) and the new status (and the comment), and ask the user to confirm. After it ran, report \
+only what it says changed or failed; never claim a change or a saved comment it does not confirm.
 - If ignored_filters is present, say those filters could not be applied.
 - If assignee_lookup is present, say plainly that nobody by that name has Contact Us requests \
 assigned and list assignees_with_requests as the available names; never phrase it as "no \

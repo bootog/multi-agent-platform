@@ -9,10 +9,13 @@
     select_subcategories     Contractor partners: GET ContractorSubCategory
     confirm_conversion       summary + explicit confirmation (waits for the user)
     create_account           POST UserDetail/AddVendorUser — at most once per conversion
+                             (with the partner's Company Logo / User Headshot, if attached)
     verify_account           GET UserDetail/GetUserRolesByEmailId (account + role present)
     link_provider_vendor     POST Provider/SaveProviderVendor (idempotent)
     save_subcategories       POST ProviderContractorSubCategory/BulkInsert
-    update_request_status    PUT ContactUs/bulk-update-file {Status: 11}
+    update_request_status    PUT ContactUs/bulk-update-file {Status: 11}, then GET ContactUs
+                             (id=…) to confirm it reads CRM Completed. Never for a partner
+                             created without a Contact Us request (see `standalone`)
     refresh_requests         GET ContactUs (the list after the change)
     search_providers         "list/find providers" (no conversion needed)
     resolve_assigned_user    "assigned to X" -> assignee id (GetContactUsAssignedUser)
@@ -22,6 +25,7 @@ failure, so "retry" resumes at the failed step and never creates a second accoun
 Critical identifiers come only from API responses, never from the LLM."""
 
 import time
+import uuid
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -30,6 +34,7 @@ from app.agents.contact_us.conversions import (
     ALL_TYPES,
     CONVERSION_TYPES,
     CUSTOMER,
+    PARTNER_FORM,
     PARTNER_TYPES,
     ConversionType,
     OPERATION_TYPE,
@@ -38,6 +43,8 @@ from app.agents.contact_us.conversions import (
     conversion_type,
     fingerprint,
     generate_password,
+    partner_type_name,
+    vendor_user_uploads,
 )
 from app.agents.contact_us.nodes import StepBlocked, StepFailed, StepResult, tracked_step
 from app.agents.contact_us.state import ContactUsChatState
@@ -55,6 +62,7 @@ from app.agents.contact_us.tools import (
 from app.core.logging import get_logger
 from app.integrations.bootog import AccountApi, BootogApiError, RoleNotFoundError
 from app.integrations.bootog.accounts import is_guid
+from app.integrations.bootog.client import CSRF_REJECTED
 from app.integrations.bootog.contact_us import CRM_COMPLETED_STATUS, name_tokens
 
 logger = get_logger(__name__)
@@ -76,27 +84,81 @@ def active_type(state: ContactUsChatState) -> ConversionType | None:
 
 
 def draft_type(state: ContactUsChatState) -> ConversionType:
-    """The form the draft follows: the conversion's type, Customer by default."""
-    return active_type(state) or CUSTOMER
+    """The form the draft follows: the conversion's type; the Partner form while a partner's
+    company type is still being chosen; Customer by default."""
+    ctype = active_type(state)
+    if ctype is None and state.get("operation") == "create_partner":
+        return PARTNER_FORM
+    return ctype or CUSTOMER
+
+
+# --- partners without a Contact Us request ------------------------------------------------
+# The host's create-partner screen is opened from many places without a Contact Us request
+# (provider management, file management, reports): its contactUsId is optional and the
+# request is marked CRM Completed only when there is one. A partner conversion started with
+# no request selected and none named is such a standalone conversion: no request_id, no
+# update_request_status step, and its card is addressed by `form_id` (an internal token,
+# never sent to BOOTOG). Customer and B2B conversions always need a request.
+
+STANDALONE_FORM_PREFIX = "new-partner:"
+
+
+def standalone(state: ContactUsChatState) -> bool:
+    return not state.get("contact_request") and bool(conversion_of(state).get("standalone"))
+
+
+def conversion_record(state: ContactUsChatState) -> dict[str, Any] | None:
+    """The data the conversion starts from: the selected request, or nothing (an empty
+    record) for a standalone partner; None when there is neither."""
+    record = state.get("contact_request")
+    if record:
+        return record
+    return {} if standalone(state) else None
+
+
+def conversion_ref(state: ContactUsChatState) -> str | None:
+    """What the conversion and its card belong to: the request id, or the standalone form id."""
+    record = state.get("contact_request")
+    if record:
+        return record.get("id")
+    return conversion_of(state).get("form_id") if standalone(state) else None
+
+
+def conversion_steps(ctype: ConversionType, conv: dict[str, Any]) -> list[str]:
+    """Execution steps of this conversion: without a request there is no status to update."""
+    steps = ctype.steps()
+    return [s for s in steps if s != "update_request_status"] if conv.get("standalone") else steps
 
 
 def conversion_draft(state: ContactUsChatState) -> dict[str, Any] | None:
-    record = state.get("contact_request")
-    if not record:
+    record = conversion_record(state)
+    if record is None:
         return None
     return build_draft(draft_type(state), record, state.get("user_customer_fields") or {})
 
 
+def conversion_uploads(state: ContactUsChatState) -> dict[str, dict[str, Any]]:
+    """Images attached to the selected request's form, when its type takes them."""
+    held = state.get("conversion_files") or {}
+    if not draft_type(state).uploads or held.get("request_id") != conversion_ref(state):
+        return {}
+    return {k: v for k, v in (held.get("files") or {}).items() if k in draft_type(state).uploads}
+
+
 def conversion_fingerprint(state: ContactUsChatState) -> str:
     conv = conversion_of(state)
-    return fingerprint(
+    parts: list[Any] = [
         conv.get("type"),
         conv.get("request_id"),
         conv.get("role_id"),
         (conv.get("target_provider") or {}).get("id"),
         sorted(s["id"] for s in conv.get("subcategories") or []),
         state.get("customer_payload") or {},
-    )
+    ]
+    uploads = sorted((k, f["sha"]) for k, f in conversion_uploads(state).items())
+    if uploads:  # a changed image needs a new confirmation; none leaves the digest as it was
+        parts.append(uploads)
+    return fingerprint(*parts)
 
 
 def _answered(state: ContactUsChatState, question: str) -> bool:
@@ -125,17 +187,40 @@ def _completed(conv: dict[str, Any], step: str, **changes: Any) -> dict[str, Any
 
 @tracked_step("start_conversion", "Preparing the conversion", "Unable to prepare the conversion.")
 async def start_conversion(state: ContactUsChatState, config: RunnableConfig) -> StepResult:
-    record = state["contact_request"]
-    request_id = record.get("id")
+    record = state.get("contact_request")
+    request_id = record.get("id") if record else None
     conv = conversion_of(state)
     turn = state.get("turn_conversion") or {}
     operation = state.get("operation")
+    update: dict[str, Any] = {}
 
-    if conv.get("request_id") != request_id:
+    if record is None:
+        # A partner without a Contact Us request. A finished one is not continued: the next
+        # partner is a new conversion with its own form id.
+        done = conversion_type(conv.get("type")) and set(
+            conversion_steps(conversion_type(conv["type"]), conv)
+        ) <= set(conv.get("completed") or [])
+        if not conv.get("standalone") or conv.get("request_id") or done:
+            # A card restored after the conversation's state was lost keeps its own form id.
+            form_id = str(turn.get("form_id") or "")
+            if not form_id.startswith(STANDALONE_FORM_PREFIX) or done:
+                form_id = STANDALONE_FORM_PREFIX + uuid.uuid4().hex
+            conv = {"request_id": None, "standalone": True, "form_id": form_id}
+    elif conv.get("request_id") != request_id:
+        previous = conv
         conv = {"request_id": request_id}
+        if previous.get("standalone") and not previous.get("create_attempted"):
+            # A partner started without a request is now linked to one: the company type,
+            # provider and images chosen so far still apply (the details stay as well).
+            conv.update({k: previous[k] for k in ("type", "target_provider", "provider_options",
+                                                  "provider_options_truncated") if previous.get(k)})
+            held = state.get("conversion_files") or {}
+            if held.get("request_id") and held["request_id"] == previous.get("form_id"):
+                update["conversion_files"] = {**held, "request_id": request_id}
     conv["blocked"] = None
+    request_ref = request_id or conv.get("form_id")
     current = conversion_type(conv.get("type"))
-    finished = bool(current) and set(current.steps()) <= set(conv.get("completed") or [])
+    finished = bool(current) and set(conversion_steps(current, conv)) <= set(conv.get("completed") or [])
     failed = conv.get("failed") or {}
     # An account may exist for an unfinished conversion: creation completed, or its answer
     # was lost (timeout / 5xx). Switching type then could create a second account.
@@ -146,14 +231,14 @@ async def start_conversion(state: ContactUsChatState, config: RunnableConfig) ->
     # A finished conversion's partner subtype is not carried into a new one.
     wanted = _wanted_type(state, conv, turn, operation, retain_partner=not finished)
 
-    if wanted and (state.get("created_customers") or {}).get(converted_key(request_id, wanted)):
+    if wanted and (state.get("created_customers") or {}).get(converted_key(request_ref, wanted)):
         conv["blocked"] = "already_converted"
         conv["blocked_type"] = wanted
-        return StepResult(f"Already converted to {conversion_type(wanted).label}", {"conversion": conv})
+        return StepResult(f"Already converted to {conversion_type(wanted).label}", {**update, "conversion": conv})
 
     if in_flight and wanted != conv.get("type"):
         conv["blocked"] = "type_locked"
-        return StepResult(f"Already started as {current.label}", {"conversion": conv})
+        return StepResult(f"Already started as {current.label}", {**update, "conversion": conv})
 
     new = conversion_type(wanted)
     if finished or wanted != conv.get("type"):
@@ -175,7 +260,9 @@ async def start_conversion(state: ContactUsChatState, config: RunnableConfig) ->
         conv["review_hold"] = True
     if state.get("explicit_create"):
         conv["review_hold"] = False
-    return StepResult(message, {"conversion": conv})
+    if conv.get("standalone"):
+        message += " — not linked to a Contact Us request"
+    return StepResult(message, {**update, "conversion": conv})
 
 
 def _wanted_type(
@@ -212,6 +299,8 @@ def _switched(state: ContactUsChatState, conv: dict[str, Any], wanted: str | Non
     uses it, and is flagged so the confirmation calls it out."""
     new = conversion_type(wanted)
     fresh: dict[str, Any] = {"request_id": conv["request_id"], "type": wanted}
+    if conv.get("standalone"):  # still the same partner form, still without a request
+        fresh.update(standalone=True, form_id=conv["form_id"])
     carried: dict[str, str] = {}
     previous_provider = conv.get("target_provider")
     if previous_provider and (new is None or new.needs_target_provider):
@@ -232,7 +321,7 @@ def converted_key(request_id: str | None, type_key: str | None) -> str:
 
 async def choose_conversion_type(state: ContactUsChatState, config: RunnableConfig) -> dict[str, Any]:
     if state.get("operation") == "create_partner":
-        question, options = "choose_partner_type", [t.label.removeprefix("Partner — ") for t in PARTNER_TYPES]
+        question, options = "choose_partner_type", [partner_type_name(t) for t in PARTNER_TYPES]
         message = "Waiting for the partner company type"
     else:  # the user asked to convert without saying into what
         question, options = "choose_conversion_type", [t.label for t in ALL_TYPES]
@@ -318,11 +407,15 @@ async def resolve_target_provider(state: ContactUsChatState, config: RunnableCon
             _waiting({"conversion": conv}, {"type": "choose_provider", "status": "needed"}),
         )
 
+    changed = (conv.get("target_provider") or {}).get("id") != chosen["id"]
     conv["target_provider"] = {"id": chosen["id"], "name": chosen["name"]}
     conv["provider_candidates"] = None
     conv["carried_over"] = {k: v for k, v in (conv.get("carried_over") or {}).items() if k != "Service provider"}
-    if conversion_type(conv.get("type")) and conversion_type(conv["type"]).needs_subcategories:
-        conv["subcategories"] = []  # sub-categories are provider-specific
+    if changed and conversion_type(conv.get("type")) and conversion_type(conv["type"]).needs_subcategories:
+        # Sub-categories are provider-specific: the chosen ones and the numbered options
+        # offered for the previous provider no longer apply. The same provider keeps them.
+        conv["subcategories"] = []
+        conv["subcategory_candidates"] = None
     return StepResult(f"Using {chosen['name']}", {"conversion": conv}, data={"providerName": chosen["name"]})
 
 
@@ -345,39 +438,81 @@ async def search_providers(state: ContactUsChatState, config: RunnableConfig) ->
 # --- assignees ----------------------------------------------------------------------------
 
 
+async def assigned_users(state: ContactUsChatState, config: RunnableConfig) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """GetContactUsAssignedUser for the agent's module, cached 10 minutes: (users, state update)."""
+    cache = state.get("assigned_users_cache") or {}
+    if cache.get("module") == state.get("module_filter") and time.time() - cache.get("at", 0) < _ASSIGNEE_CACHE_SECONDS:
+        return cache.get("users") or [], {}
+    users = await get_contact_us_assigned_users.ainvoke({"module_filter": state.get("module_filter")}, config=config)
+    return users, {"assigned_users_cache": {"at": time.time(), "module": state.get("module_filter"), "users": users}}
+
+
 @tracked_step("resolve_assigned_user", "Finding the assignee", "Unable to look up assigned users.")
 async def resolve_assigned_user(state: ContactUsChatState, config: RunnableConfig) -> StepResult:
+    """Assignee name (or "me") -> assignedUserId from GetContactUsAssignedUser. One match is
+    used and kept for later turns; several (or none) are offered to choose from, nothing is
+    listed and the filters stay as they were — never a list without the asked-for filter."""
     filters = dict(state.get("request_filters") or {})
-    wanted = _norm(filters.get("assigned_user_name"))
-    cache = state.get("assigned_users_cache") or {}
-    update: dict[str, Any] = {}
-    if cache.get("module") == state.get("module_filter") and time.time() - cache.get("at", 0) < _ASSIGNEE_CACHE_SECONDS:
-        users = cache.get("users") or []
+    users, update = await assigned_users(state, config)
+    if filters.get("assigned_to_me"):
+        # The signed-in user's own BOOTOG id (from the host's session), never a name match.
+        me = state.get("viewer_user_id")
+        found = [u for u in users if me and u["id"] == me]
+        requested = "you"
+        if not me:
+            reason = "your BOOTOG user could not be identified from this session"
+        else:
+            reason = "no requests are assigned to you"
     else:
-        users = await get_contact_us_assigned_users.ainvoke({"module_filter": state.get("module_filter")}, config=config)
-        update["assigned_users_cache"] = {"at": time.time(), "module": state.get("module_filter"), "users": users}
-
-    exact = [u for u in users if _norm(u["name"]) == wanted]
-    tokens = name_tokens(wanted)
-    partial = [u for u in users if tokens and all(t in _norm(u["name"]) for t in tokens)]
-    found = exact or partial
+        requested = filters.get("assigned_user_name")
+        wanted = _norm(requested)
+        exact = [u for u in users if _norm(u["name"]) == wanted]
+        tokens = name_tokens(wanted)
+        found = exact or [u for u in users if tokens and all(t in _norm(u["name"]) for t in tokens)]
+        reason = None
     if len(found) == 1:
-        filters["assigned_user_ids"] = [found[0]["id"]]
-        return StepResult(f"Requests assigned to {found[0]['name']}", {**update, "request_filters": filters})
+        user = found[0]
+        filters.update(assigned_user_ids=[user["id"]], assigned_user_name=None, assigned_to_me=False)
+        active = {**(state.get("active_filters") or {}), "assigned_user_id": user["id"], "assigned_user_name": user["name"]}
+        return StepResult(
+            f"Requests assigned to {user['name']}",
+            {**update, "request_filters": filters, "active_filters": active, "assignee_candidates": None},
+        )
+    candidates = [] if filters.get("assigned_to_me") else (found or users)[:_OPTION_LIMIT]
     note = {
         "assignee": {
-            "status": "ambiguous" if found else "not_found",
-            "requested": filters.get("assigned_user_name"),
-            "candidates": [u["name"] for u in (found or users)[:_OPTION_LIMIT]],
+            "status": "ambiguous" if len(found) > 1 else "not_found",
+            "requested": requested,
+            "reason": reason,
+            "candidates": [u["name"] for u in candidates],
         }
     }
     return StepResult(
-        f"No unique assignee matched “{filters.get('assigned_user_name')}”",
-        {**update, "last_tool_result": note, "pending_question": {"type": "choose_assignee"}, "awaiting_user_input": True},
+        f"No unique assignee matched “{requested}”",
+        {
+            **update,
+            "last_tool_result": note,
+            # This turn's change is undone: the list keeps the filters it had.
+            "active_filters": state.get("filters_before") if state.get("filters_before") is not None else state.get("active_filters"),
+            "filter_problems": [*(state.get("filter_problems") or []), f"assigned user '{requested}'"],
+            "assignee_candidates": candidates or None,
+            **({"pending_question": {"type": "choose_assignee", "options": [u["name"] for u in candidates]},
+                "awaiting_user_input": True} if candidates else {}),
+        },
     )
 
 
 # --- checks ---------------------------------------------------------------------------------
+
+
+def is_type_role(role: dict[str, Any], ctype: ConversionType, role_id: str | None) -> bool:
+    """The role this conversion assigns, as AddVendorUser's duplicate check sees it: the
+    same RoleId as the resolved default role. Other providers' copies of a role share its
+    name but not its id, so they don't count. By name only when an id is unknown (that
+    can only over-block, never let a duplicate through)."""
+    if role_id and role.get("roleId"):
+        return str(role["roleId"]).casefold() == role_id.casefold()
+    return str(role.get("roleName") or "").casefold() == ctype.role_name.casefold()
 
 
 @tracked_step("check_existing_account", "Checking for an existing account", "Unable to check for an existing account.")
@@ -385,30 +520,39 @@ async def check_existing_account(state: ContactUsChatState, config: RunnableConf
     conv = conversion_of(state)
     ctype = active_type(state)
     email = (state.get("customer_payload") or {}).get("email") or ""
+    failed = conv.get("failed") or {}
+    if failed.get("step") == "create_account" and failed.get("outcome_unknown") and failed.get("email", email) != email:
+        conv = await _settle_earlier_attempt(config, conv, ctype, email)
     try:
         accounts = await lookup_accounts(config, email)
     except BootogApiError as exc:
         # Not knowing is never "no account": stop before any creation.
         conv["account"] = {"email": email, "verified": False, "error": exc.message}
-        message = f"The existing-account check for {email} could not be completed, so nothing was created. {exc.message}"
+        message = f"I couldn't verify {email} because BOOTOG returned an error, so nothing was created. {exc.message}"
         raise StepFailed(message, {"conversion": conv}) from exc
 
     roles = [r for a in accounts for r in a["roles"]]
-    with_role = [r for r in roles if r["roleName"].casefold() == ctype.role_name.casefold()]
+    with_role = [r for r in roles if is_type_role(r, ctype, conv.get("role_id"))]
+    removed = [r for a in accounts for r in a.get("removedRoles") or [] if is_type_role(r, ctype, conv.get("role_id"))]
     conv["account"] = {
         "email": email,
         "verified": True,
         "exists": bool(accounts),
         "has_role": bool(with_role),
+        # Only a removed (isDelete) copy of the role: BOOTOG refuses to add it again.
+        "role_removed": bool(removed) and not with_role,
         "roles": sorted({r["roleName"] for r in roles})[:10],
     }
-    lost_answer = (conv.get("failed") or {}).get("step") == "create_account" and (conv.get("failed") or {}).get(
-        "outcome_unknown"
+    failed = conv.get("failed") or {}
+    # Only an attempt for THIS email can have created this email's account.
+    lost_answer = (
+        failed.get("step") == "create_account" and failed.get("outcome_unknown") and failed.get("email", email) == email
     )
-    if with_role and lost_answer and ctype.auto_create:
-        # Customer: a Customer role found after an attempt whose answer was lost is
-        # reported as an existing Customer. It may or may not come from that attempt —
-        # never claimed as created by it, and the request is not marked converted.
+    if with_role and lost_answer and ctype.auto_create and not failed.get("role_absent_before"):
+        # Customer: a Customer role found after an attempt whose answer was lost, when it
+        # was not known to be absent before that attempt, is reported as an existing
+        # Customer — never claimed as created by it, and the request is not marked
+        # converted. (Known absent before: that attempt wrote it; adopted below.)
         conv.update(blocked="existing_role", failed=None)
         conv["account"]["found_after_failed_attempt"] = True
         return StepResult(f"{email}: Customer already exists — not created again", {"conversion": conv})
@@ -421,8 +565,43 @@ async def check_existing_account(state: ContactUsChatState, config: RunnableConf
     if with_role:
         conv["blocked"] = "existing_role"
         return StepResult(f"{email} is already registered as {ctype.role_name}", {"conversion": conv})
+    if removed:
+        # AddVendorUser matches UserRoles without IsDelete: sending it can only be refused.
+        conv["blocked"] = "existing_role"
+        return StepResult(f"{email} has a removed {ctype.role_name} role — not sent", {"conversion": conv})
     message = f"Existing login found (roles: {', '.join(conv['account']['roles']) or 'none'})" if accounts else "No existing account"
     return StepResult(message, {"conversion": conv})
+
+
+async def _settle_earlier_attempt(
+    config: RunnableConfig, conv: dict[str, Any], ctype: ConversionType, email: str
+) -> dict[str, Any]:
+    """An earlier creation for ANOTHER email of this request got no answer, so it may have
+    created this request's account. BOOTOG is asked about that email before anything is
+    done for the new one: no role -> that attempt left nothing, carry on; the role, or no
+    answer -> stop, or one request would end up with two accounts."""
+    failed = conv["failed"]
+    earlier = failed["email"]
+    try:
+        accounts = await lookup_accounts(config, earlier)
+    except BootogApiError as exc:
+        message = (
+            f"An earlier attempt to create the account for {earlier} got no answer, and BOOTOG could not be asked "
+            f"about it now, so nothing was created for {email}. {exc.message}"
+        )
+        conv["failed"] = {**failed, "message": message}
+        raise StepFailed(message, {"conversion": conv}) from exc
+    if any(is_type_role(r, ctype, conv.get("role_id")) for a in accounts for r in a["roles"]):
+        message = (
+            f"An earlier attempt to create the account for {earlier} got no answer, and {earlier} now has the "
+            f"{ctype.role_name} role: that attempt may have created this request's account. Nothing was created "
+            f"for {email}, so the request does not get a second account. Switch the email back to {earlier} to "
+            "verify and finish it, or have an administrator check that account."
+        )
+        conv["failed"] = {**failed, "message": message, "earlier_email_has_role": True}
+        raise StepFailed(message, {"conversion": conv})
+    conv["failed"] = None  # confirmed: that attempt left no account with the role
+    return conv
 
 
 @tracked_step("resolve_role", "Looking up the role", "Unable to look up the role.")
@@ -555,39 +734,88 @@ async def create_account(state: ContactUsChatState, config: RunnableConfig) -> S
     # Recorded before the call: if the answer is lost, a retry checks Bootog first
     # (check_existing_account) instead of creating blindly.
     conv["create_attempted"] = True
+    sent = conversion_fingerprint(state)  # exactly these details; a rejection never resends them
+    email = (state.get("customer_payload") or {}).get("email")
+    checked = conv.get("account") or {}
+    # This turn's check of exactly this email found no account with the role.
+    role_absent_before = bool(checked.get("verified") and not checked.get("has_role") and checked.get("email") == email)
     form = build_vendor_user_form(
-        ctype, state.get("customer_payload") or {}, conv["role_id"], state["contact_request"], generate_password()
+        ctype, state.get("customer_payload") or {}, conv["role_id"], conversion_record(state) or {}, generate_password()
     )
+    uploads = conversion_uploads(state)
+    upload_fields, files = vendor_user_uploads(uploads)
+    form.update(upload_fields)
     try:
-        vendor_id = await AccountApi(config["configurable"]["bootog_client"]).add_vendor_user(form)
+        vendor_id = await AccountApi(config["configurable"]["bootog_client"]).add_vendor_user(form, files)
     except BootogApiError as exc:
         # `failed: true` / a 4xx is a definitive answer; a timeout, lost connection or 5xx
         # is not — the account may exist, so the next attempt checks Bootog before creating.
         unknown = exc.outcome_unknown
         kind = "unknown" if unknown else "access" if exc.status_code in (401, 403) else "rejected"
         reconciled = None
-        if unknown and ctype.auto_create:
+        # AddVendorUser never rolls back: any answer other than its duplicate refusal (sent
+        # before it writes) or a refusal that never reached it may follow the role insert.
+        may_have_written = exc.code not in ("EMAIL_EXISTS", CSRF_REJECTED) and kind != "access"
+        if may_have_written and ctype.auto_create:
             # Reconcile now (Customer): BOOTOG may have written the role before failing.
             reconciled = await _role_after_failure(config, conv, ctype)
+            if reconciled == "found" and role_absent_before:
+                # The role was not there just before this call and is there now: this
+                # attempt most likely wrote it before failing. It is recorded as THIS
+                # conversion's account (never as an existing customer) so nothing — and no
+                # other email — creates another, and the request is not marked CRM Completed.
+                message = (
+                    f"BOOTOG returned an error while creating the account, but {email} now has the "
+                    f"{ctype.role_name} role, which it did not have just before: the account was most likely "
+                    "created by this attempt and may be incomplete. CRM completion is not verified — the "
+                    "request was not marked CRM Completed."
+                )
+                conv = _completed(conv, "create_account", created_vendor_id=conv.get("created_vendor_id"))
+                conv["failed"] = {"step": "create_account", "kind": "created_with_error", "message": message, "code": exc.code}
+                _log_creation(state, "created_with_error", exc)
+                raise StepFailed(message, {"conversion": conv}) from exc
             if reconciled == "found":
                 conv.update(blocked="existing_role", failed=None)
+                _log_creation(state, "existing_role", exc)
                 raise StepBlocked(
-                    f"{ctype.label} already exists with this email address — no second account was created.",
+                    f"A {ctype.label} account already exists for this email. No duplicate account was created.",
                     {"conversion": conv},
                 ) from exc
-            if reconciled == "absent":
+            if reconciled == "absent" and unknown:
                 unknown, kind = False, "server_error"  # confirmed: no account to resume
+            elif reconciled == "unverified" and not unknown:
+                # A definitive "failed", but whether it wrote the role can't be checked:
+                # treated as unknown, so the next attempt checks BOOTOG before sending.
+                unknown, kind = True, "unknown"
         message = f"The account could not be created. {exc.message}"
         failure = _failure(
             conv, "create_account", message,
-            outcome_unknown=unknown, kind=kind, code=exc.code, fingerprint=conv.get("awaiting_fingerprint"),
-            reconciled=reconciled,
+            outcome_unknown=unknown, kind=kind, code=exc.code, fingerprint=sent,
+            reconciled=reconciled, role_absent_before=role_absent_before, email=email,
         )
+        _log_creation(state, f"failed:{kind}", exc, reconciled)
         raise StepFailed(message, failure) from exc
     finally:
         form.clear()  # drop the password as soon as the request is done
     conv = _completed(conv, "create_account", created_vendor_id=vendor_id)
-    return StepResult(f"{ctype.label} account created", {"conversion": conv})
+    _log_creation(state, "created")
+    update: dict[str, Any] = {"conversion": conv}
+    if uploads:
+        # Sent with the account: only what the card shows is kept, never the image again.
+        held = state["conversion_files"]
+        update["conversion_files"] = {
+            **held, "files": {k: {f: v for f, v in u.items() if f != "data"} for k, u in uploads.items()},
+        }
+    return StepResult(f"{ctype.label} account created", update)
+
+
+def _log_creation(state: ContactUsChatState, outcome: str, exc: BootogApiError | None = None, reconciled: str | None = None) -> None:
+    """Request id, stage and outcome for the backend team; never the email, form or password."""
+    logger.info(
+        "[CONTACT_US_AGENT] run=%s request=%s stage=create_account outcome=%s http=%s code=%s reconciled=%s",
+        state.get("run_id"), conversion_of(state).get("request_id"), outcome,
+        getattr(exc, "status_code", None), getattr(exc, "code", None), reconciled,
+    )
 
 
 async def lookup_accounts(config: RunnableConfig, email: str) -> list[dict[str, Any]]:
@@ -608,7 +836,7 @@ async def _role_after_failure(config: RunnableConfig, conv: dict[str, Any], ctyp
         accounts = await lookup_accounts(config, email)
     except BootogApiError:
         return "unverified"
-    found = any(r["roleName"].casefold() == ctype.role_name.casefold() for a in accounts for r in a["roles"])
+    found = any(is_type_role(r, ctype, conv.get("role_id")) for a in accounts for r in a["roles"])
     if found:
         conv["account"] = {
             **(conv.get("account") or {}),
@@ -623,15 +851,14 @@ async def verify_account(state: ContactUsChatState, config: RunnableConfig) -> S
     conv = conversion_of(state)
     ctype = active_type(state)
     email = (conv.get("account") or {}).get("email") or (state.get("customer_payload") or {}).get("email")
-    accounts = await get_accounts_by_email.ainvoke({"email": email}, config=config)
-    match = next(
-        (a for a in accounts if any(r["roleName"].casefold() == ctype.role_name.casefold() for r in a["roles"])), None
-    )
+    accounts = await lookup_accounts(config, email)  # same case handling as the pre-check
+    role_id = conv.get("role_id")
+    match = next((a for a in accounts if any(is_type_role(r, ctype, role_id) for r in a["roles"])), None)
     if match is None:
         message = f"Bootog reported the account as created, but {email} doesn't have the {ctype.role_name} role yet."
         raise StepFailed(message, _failure(conv, "verify_account", message))
     vendor = conv.get("created_vendor_id") or next(
-        (r["providerId"] for r in match["roles"] if r["roleName"].casefold() == ctype.role_name.casefold() and is_guid(r.get("providerId"))),
+        (r["providerId"] for r in match["roles"] if is_type_role(r, ctype, role_id) and is_guid(r.get("providerId"))),
         None,
     )
     if ctype.needs_target_provider and not vendor:
@@ -673,15 +900,40 @@ async def save_subcategories(state: ContactUsChatState, config: RunnableConfig) 
 @tracked_step("update_request_status", "Marking the request CRM Completed", "Updating the request status failed.")
 async def update_request_status(state: ContactUsChatState, config: RunnableConfig) -> StepResult:
     conv = conversion_of(state)
+    if not conv.get("request_id"):  # not a step of a standalone partner; never sent without a request
+        raise StepFailed("There is no Contact Us request to update.", {"conversion": conv})
     try:
         await mark_contact_request_converted.ainvoke({"request_id": conv["request_id"]}, config=config)
     except BootogApiError as exc:
         message = f"The request status could not be updated. {exc.message}"
         raise StepFailed(message, _failure(conv, "update_request_status", message)) from exc
-    record = {**state["contact_request"], "status": CRM_COMPLETED_STATUS}  # what Bootog now holds
+    # bulk-update-file answers "Update completed successfully." whatever it changed (it
+    # ignores the affected-row count): only the request read back proves CRM Completed.
+    try:
+        page = await get_contact_us_requests.ainvoke(
+            {"request_id": conv["request_id"], "provider_id": state.get("provider_id"), "module_filter": state.get("module_filter")},
+            config=config,
+        )
+    except BootogApiError as exc:
+        message = (
+            "BOOTOG accepted the status update, but the request could not be read back, so CRM Completed is "
+            f"not verified. {exc.message}"
+        )
+        raise StepFailed(message, _failure(conv, "update_request_status", message, unverified=True)) from exc
+    record = next((r for r in page["records"] if r.get("id") == conv["request_id"]), None)
+    if record is None or record.get("status") != CRM_COMPLETED_STATUS:
+        message = (
+            "BOOTOG answered the status update as successful, but the request "
+            + ("could not be found when read back" if record is None else "still does not show CRM Completed")
+            + ", so the conversion is not confirmed as complete."
+        )
+        raise StepFailed(message, _failure(conv, "update_request_status", message, unverified=True))
     return StepResult(
-        "Request marked CRM Completed",
-        {"conversion": _completed(conv, "update_request_status", status=CRM_COMPLETED_STATUS), "contact_request": record},
+        "Request marked CRM Completed (verified)",
+        {
+            "conversion": _completed(conv, "update_request_status", status=CRM_COMPLETED_STATUS),
+            "contact_request": {**state["contact_request"], **record},
+        },
     )
 
 

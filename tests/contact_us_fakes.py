@@ -78,6 +78,12 @@ SUBCATEGORIES: list[dict[str, Any]] = [
 ]
 
 
+def _role_id(account_role: dict[str, Any]) -> str | None:
+    """A registered role's id: the default role's unless the entry names another (another
+    provider's copy of the role carries the same name under a different id)."""
+    return account_role.get("roleId") or ROLE_IDS.get(account_role["roleName"])
+
+
 class FakeBootog:
     """Answers the Bootog calls the agent makes; records every request."""
 
@@ -89,9 +95,13 @@ class FakeBootog:
         # email -> [{"providerId", "providerName", "roleName"}]
         self.accounts: dict[str, list[dict[str, Any]]] = {}
         # Failure switches for the write calls.
-        self.create_failure: str | None = None  # "failed" (HTTP 200 failed:true) | "timeout" | "timeout_after_create"
+        # "failed" (HTTP 200 failed:true) | "timeout" | "timeout_after_create" | "fault_after_role"
+        # | "rejected_after_role" (a business failed:true from a step after the role insert)
+        self.create_failure: str | None = None
         self.fail_link = False
         self.fail_status_update = False
+        # bulk-update-file answers success but changes nothing (the service ignores row counts).
+        self.status_update_noop = False
         self.fail_subcategories = False
         # Gateway anti-forgery: tokens issued on GETs, required on POSTs.
         self.issue_xsrf = True
@@ -102,6 +112,13 @@ class FakeBootog:
         self.vendor_links: list[dict[str, Any]] = []
         self.status_updates: list[dict[str, Any]] = []
         self.subcategory_inserts: list[Any] = []
+        # ContactUs/ChangeStatus and the tracking history it writes.
+        # change_status_failure: "failed" (failed:true) | "timeout" | "partial" (only the first id)
+        # | "noop" (reports success, changes nothing)
+        self.change_status_failure: str | None = None
+        self.status_changes: list[dict[str, Any]] = []
+        self.history: dict[str, list[dict[str, Any]]] = {}
+        self.history_failure: str | None = None  # "error" (HTTP 500) | "malformed"
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self._handle)
@@ -151,6 +168,10 @@ class FakeBootog:
             return httpx.Response(200, json=[{"assignedUserId": k, "assignedUserName": v} for k, v in users.items()])
         if path.endswith("/ContactUs/bulk-update-file"):
             return self._bulk_update(json.loads(request.content))
+        if path.endswith("/ContactUs/ChangeStatus"):
+            return self._change_status(request, json.loads(request.content))
+        if path.endswith("/ContactUs/GetContactUsTrackingHistory"):
+            return self._tracking_history(query)
         if path.endswith("/ProviderUserMapping/GetProviderUserMappingBySession"):
             return httpx.Response(200, json={"data": [{"providerId": "p1", "providerName": "Inspection Depot"}]})
         if path.endswith("/Provider/SearchProviders"):
@@ -165,7 +186,7 @@ class FakeBootog:
             return self._accounts(query.get("emailId", ""))
         if path.endswith("/Roles/GetRoles"):
             name = query.get("roleNames")
-            rows = [{"id": ROLE_IDS[name], "name": name, "isDefault": True}] if name in ROLE_IDS else []
+            rows = [{"id": ROLE_IDS[name], "name": name, "isDefault": True, "isActive": True}] if name in ROLE_IDS else []
             return httpx.Response(200, json={"count": len(rows), "data": rows})
         if path.endswith("/UserDetail/AddVendorUser"):
             return self._add_vendor_user(request)
@@ -215,10 +236,43 @@ class FakeBootog:
         self.status_updates.append(body)
         if self.fail_status_update:
             return httpx.Response(500, json={"message": "Update failed.", "error": "db"})
+        if self.status_update_noop:
+            return httpx.Response(200, json={"message": "Update completed successfully."})
         for r in self.records:
             if r["id"] in body["ids"]:
                 r["status"] = body["updateValues"]["Status"]
         return httpx.Response(200, json={"message": "Update completed successfully."})
+
+    def _change_status(self, request: httpx.Request, body: dict[str, Any]) -> httpx.Response:
+        """ContactUs/ChangeStatus {status, ids, comments?} -> Result {value: changed ids}; each
+        change is recorded in the request's tracking history with the comment."""
+        self.status_changes.append(body)
+        if self.change_status_failure == "failed":
+            return httpx.Response(200, json={"value": None, "failed": True, "message": "Status change not allowed", "failures": []})
+        if self.change_status_failure == "timeout":
+            raise httpx.ReadTimeout("timed out", request=request)
+        ids = body["ids"][:1] if self.change_status_failure == "partial" else body["ids"]
+        if self.change_status_failure != "noop":
+            for r in self.records:
+                if r["id"] in ids:
+                    r["status"] = body["status"]
+                    self.history.setdefault(r["id"], []).append({
+                        "contactUsId": r["id"], "contactUsStatus": body["status"], "statusComments": body.get("comments"),
+                        "note": None, "userName": "Michael Rowan", "createdByUserName": "", "followUpNeeded": False,
+                        "dateOfFollowUp": None, "createdDateTime": f"2026-10-26T10:{len(self.status_changes):02d}:00+00:00",
+                        "id": str(uuid.uuid4()),
+                    })
+        return httpx.Response(200, json={"value": ids, "failed": False, "message": "", "failures": [], "exception": None})
+
+    def _tracking_history(self, query: dict[str, str]) -> httpx.Response:
+        if self.history_failure == "error":
+            return httpx.Response(500, json={"message": "History unavailable"})
+        if self.history_failure == "malformed":
+            return httpx.Response(200, json={"items": "nope"})
+        m = re.fullmatch(r"contactUsId=([A-Za-z0-9-]+)", query.get("filter", ""))
+        rows = list(reversed(self.history.get(m.group(1), []))) if m else []  # createdDate desc
+        size = int(query.get("pageSize", "10"))
+        return httpx.Response(200, json={"count": len(rows), "data": rows[:size]})
 
     def _search_providers(self, query: dict[str, str]) -> httpx.Response:
         prefix = (query.get("providerName") or "").casefold()
@@ -229,14 +283,22 @@ class FakeBootog:
         return httpx.Response(200, json=rows[(page - 1) * size: page * size])
 
     def _accounts(self, email: str) -> httpx.Response:
-        roles = self.accounts.get(email)  # exact, case-sensitive like the real service
+        """UserDetailService.GetUserRolesByEmailIdAsync: `WHERE u."Email" = @Email` (exact,
+        case-sensitive), LEFT JOINs UserRoles/Roles without filtering IsDelete, grouped as
+        List<UserProfileModel> -> providers (ProviderDetailModel) -> roles (RoleDetailModel)."""
+        roles = self.accounts.get(email)
         if not roles:
             return httpx.Response(200, json=[])
         providers: dict[str, dict[str, Any]] = {}
         for r in roles:
             p = providers.setdefault(r["providerId"], {"providerId": r["providerId"], "providerName": r.get("providerName"), "roles": []})
-            p["roles"].append({"roleId": ROLE_IDS.get(r["roleName"]), "roleName": r["roleName"]})
-        return httpx.Response(200, json=[{"userId": "user-" + email, "userEmail": email, "providers": list(providers.values())}])
+            p["roles"].append({
+                "roleId": _role_id(r), "roleName": r["roleName"], "normalizedName": r["roleName"].upper(),
+                "isDefault": True, "isDelete": bool(r.get("deleted")),
+            })
+        user = {"userId": "user-" + email, "userName": "Test User", "userEmail": email, "userPhone": None,
+                "userHeadShot": None, "providers": list(providers.values())}
+        return httpx.Response(200, json=[user])
 
     def _add_vendor_user(self, request: httpx.Request) -> httpx.Response:
         content_type = request.headers.get("content-type", "")
@@ -252,10 +314,23 @@ class FakeBootog:
             raise httpx.ReadTimeout("timed out", request=request)
         role = next(name for name, rid in ROLE_IDS.items() if rid == form["RoleId"])
         email = form["Email"]
-        if any(r["roleName"] == role for r in self.accounts.get(email, [])):
+        # UserRoles WHERE UserId AND RoleId — deleted rows included, other roles' ids not.
+        if any(_role_id(r) == form["RoleId"] for r in self.accounts.get(email, [])):
             return httpx.Response(200, json={"failed": True, "message": "User Email Id Already Exists!", "failures": []})
         provider_id = TENANT_ID if form["IsSkipTenant"] == "false" else str(uuid.uuid4())
         self.accounts.setdefault(email, []).append({"providerId": provider_id, "providerName": form["ProviderName"], "roleName": role})
+        if self.create_failure == "fault_after_role":
+            # AddVendorUserAsync inserts the login and UserRoles row first; a later step
+            # throws and the catch-all answers failed:true with the .NET message. Nothing
+            # is rolled back (RemoveUserAccountAsync only acts when its model is null).
+            return httpx.Response(200, json={
+                "value": None, "failed": True, "failures": [], "exception": None,
+                "message": "Object reference not set to an instance of an object.",
+            })
+        if self.create_failure == "rejected_after_role":
+            # SaveUserDetails / AddVendor answer failed:true with a business message; the
+            # login and UserRoles row written before stay (the rollback never runs).
+            return httpx.Response(200, json={"value": None, "failed": True, "failures": [], "message": "Phone Number Already Exists"})
         if self.create_failure == "timeout_after_create":
             raise httpx.ReadTimeout("timed out", request=request)
         return httpx.Response(

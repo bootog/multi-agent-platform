@@ -11,7 +11,10 @@ POST /UserDetail/AddVendorUser  [FromForm] UserProviderModel -> Result {value, f
      IsSkipTenant=true without a TargetProviderId), not the user id. The server sends the
      password in the "account created" email (Auth0 forces a change on first login). It is
      NOT idempotent and has no rollback: a repeat with the same role fails with
-     "User Email Id Already Exists!". Its catch-all returns any .NET exception as
+     "User Email Id Already Exists!" — matched on UserRoles (UserId, RoleId) WITHOUT
+     IsDelete, so a removed role blocks it too. Every failure after the UserRoles insert
+     leaves the login and role behind (RemoveUserAccountAsync only acts on a null model,
+     i.e. never), whatever message comes back. Its catch-all returns any .NET exception as
      `failed: true` + the exception message (e.g. "Object reference not set to an instance of
      an object."), AFTER the Auth0 login and UserRoles row were written — a partial account."""
 
@@ -35,6 +38,9 @@ class AccountRole:
     role_name: str
     # UserRoles."IsDelete": a removed role is history, not an active role.
     deleted: bool = False
+    # UserRoles."RoleId": AddVendorUser's duplicate check matches on it (not on the name,
+    # which other providers' copies of a role share).
+    role_id: str | None = None
 
     @property
     def active(self) -> bool:
@@ -79,6 +85,8 @@ _SERVER_FAULT = re.compile(
     r"\bat [A-Z][\w.]+\.[\w<>]+\(",  # a stack-trace frame
     re.IGNORECASE,
 )
+# AddVendorUserAsync's answer when the email already has an account with the role.
+_EMAIL_EXISTS = re.compile(r"\bemail\b.*\balready exists\b", re.IGNORECASE)
 
 
 class AccountApi:
@@ -121,6 +129,7 @@ class AccountApi:
                         roles.append(AccountRole(
                             provider.get("providerId"), provider.get("providerName"), str(role["roleName"]),
                             deleted=role.get("isDelete") is True,
+                            role_id=role.get("roleId") if is_guid(role.get("roleId")) else None,
                         ))
             accounts.append(ExistingAccount(row.get("userId"), row.get("userName"), roles))
         return accounts
@@ -169,11 +178,14 @@ class AccountApi:
             f"The default '{role_name}' role could not be verified (the role returned {', '.join(dict.fromkeys(reasons))})."
         )
 
-    async def add_vendor_user(self, fields: dict[str, Any]) -> str | None:
+    async def add_vendor_user(
+        self, fields: dict[str, Any], files: dict[str, tuple[str, bytes, str]] | None = None
+    ) -> str | None:
         """Creates the account; returns the provider id from `value` (None when Bootog
         reports success without a usable id). Raises on HTTP or application failure.
-        `fields` holds the password: it is sent once and never logged or returned."""
-        body = await self._client.post_form("UserDetail/AddVendorUser", fields)
+        `fields` holds the password: it is sent once and never logged or returned.
+        `files`: the LogoFile / HeadshotFile parts, when images are attached."""
+        body = await self._client.post_form("UserDetail/AddVendorUser", fields, files)
         try:
             result = check_result(body, "Creating the account")
         except BootogResultError as exc:
@@ -185,6 +197,9 @@ class AccountApi:
                     "details sent). Part of the account may already exist.",
                     code="SERVER_FAULT",
                 ) from exc
+            if _EMAIL_EXISTS.search(exc.message):
+                # A definitive business rejection of this email; nothing was created.
+                raise BootogResultError(exc.message, code="EMAIL_EXISTS") from exc
             raise
         value = result.get("value")
         return value if isinstance(value, str) and _GUID.match(value) and value != EMPTY_GUID else None

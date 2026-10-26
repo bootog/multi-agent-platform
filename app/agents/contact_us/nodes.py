@@ -146,6 +146,7 @@ async def get_contact_us_data(state: ContactUsAgentState, config: RunnableConfig
             "all_statuses": bool(filters.get("all_statuses")),
             "assigned_user_ids": filters.get("assigned_user_ids"),
             "request_id": filters.get("request_id"),
+            "page": int(filters.get("page") or 1),
         },
         config=config,
     )
@@ -155,6 +156,8 @@ async def get_contact_us_data(state: ContactUsAgentState, config: RunnableConfig
         message = f"Searched all {noun}s — {len(records)} match{'es' if len(records) != 1 else ''}"
         if page.get("truncated"):
             message += " (search stopped at the page limit; older requests may be missing)"
+    elif (page.get("page") or 1) > 1:
+        message = f"Retrieved page {page['page']} — {len(records)} of {total} {noun}s"
     elif len(records) == total:
         message = f"Retrieved {total} {noun}{'s' if total != 1 else ''}"
     else:

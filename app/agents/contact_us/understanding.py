@@ -34,6 +34,8 @@ Intent = Literal[
     "confirm_action",
     "retry_operation",
     "cancel_operation",
+    "show_history",
+    "change_status",
     "other",
 ]
 
@@ -53,12 +55,16 @@ INTENT_LABELS: dict[str, str] = {
     "confirm_action": "Confirmation",
     "retry_operation": "Retry the failed step",
     "cancel_operation": "Cancel the current task",
+    "show_history": "Show the request's history",
+    "change_status": "Change the request status",
     "other": "General question",
 }
 
 # Intents that act on a specific Contact Us request.
 CONVERSION_INTENTS = {"create_customer", "create_b2b_client", "create_partner", "convert_request"}
-REQUEST_INTENTS = {"find_request", "show_request_details"} | CONVERSION_INTENTS
+# A request's tracking history, and changing its status (ContactUs/ChangeStatus).
+REQUEST_ACTION_INTENTS = {"show_history", "change_status"}
+REQUEST_INTENTS = {"find_request", "show_request_details"} | CONVERSION_INTENTS | REQUEST_ACTION_INTENTS
 # Intents that move a conversion forward when one is in progress.
 _DETAIL_INTENTS = {"provide_information", "confirm_action", "retry_operation", "edit_details", "review_details"}
 ADVANCING_INTENTS = CONVERSION_INTENTS | _DETAIL_INTENTS
@@ -84,6 +90,13 @@ class RequestFilters(BaseModel):
     company_name: str | None = Field(None, description="Company whose requests the user wants to list (session company filter).")
     statuses: list[str] = Field(default_factory=list, description="Request status names, e.g. 'Under Review', 'CRM Completed'.")
     assigned_user_name: str | None = Field(None, description="Person the requests are assigned to.")
+    all_statuses: bool = Field(False, description="The user explicitly asks for every status ('all statuses').")
+    clear: list[Literal["status", "date", "company", "assignee", "all"]] = Field(
+        default_factory=list, description="Active list filters the user removes ('all' = clear every filter)."
+    )
+    assigned_to_me: bool = Field(False, description="The user asks for the requests assigned to them ('my requests').")
+    page: Literal["next", "previous"] | None = Field(None, description="Next / previous page of the same list.")
+    page_number: int | None = Field(None, description="A specific page of the same list, when the user names one.")
 
 
 # One optional string per conversion form field, generated from FIELD_SPECS so the LLM
@@ -115,6 +128,14 @@ class ConversionDetails(BaseModel):
     review_first: bool = Field(False, description="The user wants to see / check the details before the account is created.")
 
 
+class StatusChange(BaseModel):
+    status: str | None = Field(None, description="The new status name, in the user's words ('Approved', 'cancel it' -> 'Cancelled').")
+    comment: str | None = Field(None, description="A comment the user wants recorded with the change, word for word.")
+    positions: list[int] = Field(
+        default_factory=list, description="1-based numbers of SEVERAL requests in the last list to change ('1 and 3')."
+    )
+
+
 class ProviderQuery(BaseModel):
     name: str | None = Field(None, description="Provider name or part of it.")
     location: str | None = Field(None, description="City/state the providers should be in.")
@@ -133,6 +154,7 @@ class TurnUnderstanding(BaseModel):
     filters: RequestFilters | None = None
     customer_field_updates: CustomerFieldUpdates | None = None  # type: ignore[valid-type]
     conversion: ConversionDetails | None = None
+    status_change: StatusChange | None = None
     provider_query: ProviderQuery | None = None
     extra_information: list[ExtraInfo] = Field(default_factory=list)
 
