@@ -31,23 +31,34 @@ class StepResult:
 
 
 class StepFailed(Exception):
-    """Expected failure with a user-safe message."""
+    """Expected failure with a user-safe message. `update` is still applied to the state
+    (e.g. "the account was created, then linking failed"), so a retry can resume safely."""
+
+    def __init__(self, message: str, update: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.update = update or {}
 
 
 class StepBlocked(Exception):
-    """The step cannot run yet (e.g. an API is not configured). Not a success."""
+    """The step must not go ahead (e.g. an API is not configured, or the account already
+    exists). Not a success. `update` is still applied to the state, like StepFailed."""
+
+    def __init__(self, message: str, update: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.update = update or {}
 
 
 NodeFn = Callable[[ContactUsAgentState, RunnableConfig], Awaitable[StepResult]]
 
 
-def tracked_step(step_id: str, running_message: str, failure_message: str):
+def tracked_step(step_id: str, running_message: str | Callable[[ContactUsAgentState], str], failure_message: str):
     def decorator(fn: NodeFn):
         @functools.wraps(fn)
         async def node(state: ContactUsAgentState, config: RunnableConfig) -> dict[str, Any]:
             emitter: RunEmitter = config["configurable"]["emitter"]
             run_id = state["run_id"]
-            await emitter.step(step_id, "running", running_message)
+            message = running_message(state) if callable(running_message) else running_message
+            await emitter.step(step_id, "running", message)
             log_step(logger, AGENT, run_id, step_id, "running")
             started = time.perf_counter()
 
@@ -59,9 +70,10 @@ def tracked_step(step_id: str, running_message: str, failure_message: str):
             except (StepBlocked, CustomerApiNotConfiguredError) as exc:
                 await emitter.step(step_id, "blocked", str(exc), duration_ms=elapsed())
                 log_step(logger, AGENT, run_id, step_id, "blocked", elapsed())
-                return {"current_step": step_id, "execution_status": "blocked", "error": str(exc)}
+                update = getattr(exc, "update", None) or {}
+                return {**update, "current_step": step_id, "execution_status": "blocked", "error": str(exc)}
             except StepFailed as exc:
-                return await _fail(emitter, run_id, step_id, str(exc), elapsed())
+                return {**exc.update, **await _fail(emitter, run_id, step_id, str(exc), elapsed())}
             except BootogApiError as exc:
                 return await _fail(emitter, run_id, step_id, f"{failure_message} {exc.message}", elapsed())
             except Exception as exc:  # unexpected: keep details in logs only
@@ -108,17 +120,51 @@ async def select_provider(state: ContactUsAgentState, config: RunnableConfig) ->
     return StepResult(f"Using {match['providerName']}", {"provider_name": match["providerName"]})
 
 
-@tracked_step("get_contact_us_data", "Pulling Contact Us requests", "Unable to retrieve Contact Us requests.")
+def _request_noun(state: ContactUsAgentState) -> str:
+    """"Contact Us request" for the run workflow; the chat agent's own kind otherwise."""
+    return (state.get("agent_name") or "Contact Us Agent").removesuffix(" Agent") + " request"
+
+
+@tracked_step(
+    "get_contact_us_data",
+    lambda state: f"Pulling {_request_noun(state)}s",
+    "Unable to retrieve Contact Us requests.",
+)
 async def get_contact_us_data(state: ContactUsAgentState, config: RunnableConfig) -> StepResult:
-    page = await get_contact_us_requests.ainvoke({"provider_id": state.get("provider_id")}, config=config)
+    # `request_filters` / `module_filter` are only set by the chat agent; the run workflow
+    # never sets them, so it keeps the documented Contact-Us filter.
+    filters = state.get("request_filters") or {}
+    page = await get_contact_us_requests.ainvoke(
+        {
+            "provider_id": state.get("provider_id"),
+            "contact_name": filters.get("contact_name"),
+            "email": filters.get("email"),
+            "created_from": filters.get("created_from"),
+            "created_to": filters.get("created_to"),
+            "module_filter": state.get("module_filter"),
+            "statuses": filters.get("statuses"),
+            "all_statuses": bool(filters.get("all_statuses")),
+            "assigned_user_ids": filters.get("assigned_user_ids"),
+            "request_id": filters.get("request_id"),
+            "page": int(filters.get("page") or 1),
+        },
+        config=config,
+    )
     records, total = page["records"], page["total"]
-    if len(records) == total:
-        message = f"Retrieved {total} Contact Us request{'s' if total != 1 else ''}"
+    noun = _request_noun(state)
+    if page.get("search"):
+        message = f"Searched all {noun}s — {len(records)} match{'es' if len(records) != 1 else ''}"
+        if page.get("truncated"):
+            message += " (search stopped at the page limit; older requests may be missing)"
+    elif (page.get("page") or 1) > 1:
+        message = f"Retrieved page {page['page']} — {len(records)} of {total} {noun}s"
+    elif len(records) == total:
+        message = f"Retrieved {total} {noun}{'s' if total != 1 else ''}"
     else:
-        message = f"Retrieved the latest {len(records)} of {total} Contact Us requests"
+        message = f"Retrieved the latest {len(records)} of {total} {noun}s"
     return StepResult(
         message,
-        {"contact_requests": records, "contact_requests_total": total},
+        {"contact_requests": records, "contact_requests_total": total, "contact_requests_truncated": bool(page.get("truncated"))},
         data={"retrieved": len(records), "total": total},
     )
 

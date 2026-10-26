@@ -3,4 +3,8 @@ uvicorn[standard]
 httpx
 langgraph
 langchain-core
+langchain-openai
+python-dotenv
 pytest
+asyncpg
+tzdata

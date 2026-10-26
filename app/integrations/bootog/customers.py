@@ -1,19 +1,19 @@
-"""Customer operations.
+"""Customer creation for the one-shot run workflow (POST /contact-us/runs).
 
-ContactUS.pdf does NOT document a customer-creation endpoint or its payload.
-The only customer-related entry is `UserDetail/GetCustomerDetails`, listed without
-parameters or a response, so it is not wired either.
-
-`CustomerApi.create` therefore refuses to run until the real endpoint and payload
-are confirmed. To enable it: implement the call here (path + exact field names from
-the documented payload) and map `CustomerDraft` to that payload in `to_payload`.
-Nothing else in the agent needs to change."""
+Customers ARE created by the chat agent: it collects missing details, checks for an
+existing account, resolves the role and asks for confirmation before calling
+UserDetail/AddVendorUser (see app/agents/contact_us/conversions.py). The run workflow
+has no way to ask for details or a confirmation, so its create step stays blocked and
+sends nothing."""
 
 from typing import Any
 
 from app.integrations.bootog.client import BootogClient
 
-CUSTOMER_API_NOT_CONFIGURED = "Customer creation API not yet configured"
+CUSTOMER_API_NOT_CONFIGURED = (
+    "Customer creation is done in the Contact Us chat agent, which collects missing details "
+    "and asks for confirmation first"
+)
 
 
 class CustomerApiNotConfiguredError(Exception):
