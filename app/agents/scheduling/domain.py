@@ -121,6 +121,13 @@ def _int(value: Any) -> int:
         return 0
 
 
+# Reference lists the chat can show (list_reference), with their titles.
+REFERENCE_TITLES = {
+    "service_types": "Service types", "programs": "Programs", "time_zones": "Time zones",
+    "order_statuses": "Order statuses", "sub_statuses": "Order sub-statuses", "providers": "Providers",
+}
+
+
 # --- orders ----------------------------------------------------------------------
 
 # Service statuses (OrderStatus names) from which the Assign/Schedule action applies.
@@ -701,6 +708,8 @@ def schedule_payload(
 # response-result, client-contact-log-visibility). These are the API's codes.
 CONTACT_TYPES = {"phone_call": 1, "sms": 2, "email": 3, "email_and_sms": 4, "note": 5}
 CONTACT_TYPE_LABELS = {1: "Phone Call", 2: "SMS", 3: "Email", 4: "Email & SMS", 5: "Note"}
+# Channels the chat can log (the form's combined "Email & SMS" is not offered).
+LOG_CHANNELS = [c for c in CONTACT_TYPES if c != "email_and_sms"]
 CALLER_TYPES = {"policyholder": 1, "agent": 2, "agency_csr": 3, "property_manager": 4, "family_member": 5, "realtor": 6, "other": 7}
 PERSON_TYPES = {"inbound": 1, "outbound": 2}
 RESPONSE_RESULTS = {
@@ -760,7 +769,7 @@ def log_payload(order_id: str, log: dict[str, Any], clock: LocalClock) -> dict[s
 def missing_log_fields(log: dict[str, Any]) -> list[str]:
     """What the Add Log form requires for the channel and is still missing."""
     channel = log.get("channel")
-    if channel not in CONTACT_TYPES or channel == "email_and_sms":
+    if channel not in LOG_CHANNELS:
         return ["channel (phone call, SMS, email or note)"]
     missing = []
     if not log.get("message"):

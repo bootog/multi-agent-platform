@@ -476,10 +476,14 @@ async def list_orders(turn: Turn) -> dict[str, Any]:
     return update
 
 
+def _fetch_page_size() -> int:
+    return max(1, get_settings().scheduling_order_fetch_page_size)
+
+
 async def _all_orders(turn: Turn, filters: dict[str, Any], max_pages: int) -> tuple[list[dict[str, Any]], int, bool]:
     """Every order matching the filters, read page by page until GetOrderDetails' count is
     reached. An order seen on an earlier page (the list shifted while paging) is kept once."""
-    batch, records, seen, total = 50, [], set(), 0
+    batch, records, seen, total = _fetch_page_size(), [], set(), 0
     for page in range(1, max_pages + 1):
         result = await turn.orders.list_orders(page=page, page_size=batch, filters=filters)
         total = result.total
@@ -499,7 +503,7 @@ async def _orders_created_between(turn: Turn, query: dict[str, Any], max_pages: 
     orders created in the user's local date range, stopping once past it."""
     first = domain.parse_day(query.get("created_from")) or date.min
     last = domain.parse_day(query.get("created_to")) or date.max
-    batch, matched = 50, []
+    batch, matched = _fetch_page_size(), []
     for page in range(1, max_pages + 1):
         result = await turn.orders.list_orders(page=page, page_size=batch, filters=query["filters"])
         older = False
@@ -686,6 +690,10 @@ async def _load_producers(
     return producers
 
 
+# Producers kept for an order (the list the user picks from by name or number).
+_PRODUCERS_KEPT = 25
+
+
 async def _producers_for(
     turn: Turn, order: dict[str, Any], update: dict[str, Any], limit: float | None = None,
     filters: dict[str, list[str]] | None = None,
@@ -696,7 +704,7 @@ async def _producers_for(
         return cached["items"]
     limit = limit if limit is not None else _distance_limit(turn)
     items = await _load_producers(turn, order, limit, filters)
-    update["producers"] = {"orderId": order["id"], "items": items[:25], "total": len(items), "maxDistanceMiles": limit,
+    update["producers"] = {"orderId": order["id"], "items": items[:_PRODUCERS_KEPT], "total": len(items), "maxDistanceMiles": limit,
                            "filters": filters}
     return update["producers"]["items"]
 
@@ -712,7 +720,7 @@ async def find_producers(turn: Turn) -> dict[str, Any]:
     update["producers"] = None  # always a fresh search when asked
     limit = _distance_limit(turn)
     items = await _load_producers(turn, order, limit)
-    update["producers"] = {"orderId": order["id"], "items": items[:25], "total": len(items), "maxDistanceMiles": limit}
+    update["producers"] = {"orderId": order["id"], "items": items[:_PRODUCERS_KEPT], "total": len(items), "maxDistanceMiles": limit}
     _show_producers(turn)
     reason = domain.eligibility(order, "assign")
     if reason:
@@ -924,7 +932,7 @@ def _window(turn: Turn, start: date | None = None, days: int | None = None) -> l
     slot = turn.u.get("slot") or {}
     first = start or domain.parse_day(slot.get("from_date")) or turn.clock.today()
     first = max(first, turn.clock.today())
-    count = max(1, min(int(days or slot.get("days") or settings.scheduling_slot_days), 14))
+    count = max(1, min(int(days or slot.get("days") or settings.scheduling_slot_days), settings.scheduling_max_slot_days))
     return [first + timedelta(days=i) for i in range(count)]
 
 
@@ -939,7 +947,7 @@ async def _availability(turn: Turn, order: dict[str, Any], producer: dict[str, A
         duration = domain.order_duration_minutes(order)
         result = domain.available_slots(
             days=days, working_hours=hours, booked=booked, blocks=blocks, duration_minutes=duration,
-            clock=turn.clock, ignore_order_id=order["id"],
+            clock=turn.clock, ignore_order_id=order["id"], per_day_limit=max(1, get_settings().scheduling_slots_per_day),
         )
         open_count = sum(len(d["slots"]) for d in result)
         rec.message = f"{open_count} open slot(s) over {len(days)} day(s)"
@@ -1109,18 +1117,12 @@ async def list_logs(turn: Turn) -> dict[str, Any]:
 
 # --- reference data -----------------------------------------------------------------
 
-_REFERENCE_TITLES = {
-    "service_types": "Service types", "programs": "Programs", "time_zones": "Time zones",
-    "order_statuses": "Order statuses", "sub_statuses": "Order sub-statuses", "providers": "Providers",
-}
-
-
 @agent_node("list_reference")
 async def list_reference(turn: Turn) -> dict[str, Any]:
     kind = turn.u.get("reference_kind")
-    if kind not in _REFERENCE_TITLES:
+    if kind not in domain.REFERENCE_TITLES:
         raise NeedInput("Which list do you need: service types, programs, time zones, order statuses, sub-statuses or providers?")
-    async with turn.step("load_lookups", f"Loading {_REFERENCE_TITLES[kind].lower()}", "Unable to load that list.") as rec:
+    async with turn.step("load_lookups", f"Loading {domain.REFERENCE_TITLES[kind].lower()}", "Unable to load that list.") as rec:
         if kind == "service_types":
             rows = await turn.orders.service_types()
             items = sorted({f"{r.get('text')}" + (f" ({r['categoryName'].strip()})" if r.get("categoryName") else "") for r in rows if r.get("text")})
@@ -1140,7 +1142,7 @@ async def list_reference(turn: Turn) -> dict[str, Any]:
             items = sorted({str(r["text"]) for r in rows if r.get("text")})
         rec.message = f"{len(items)} item(s)"
     turn.show("reference")
-    return {"reference": {"kind": kind, "title": _REFERENCE_TITLES[kind], "items": items[:200], "total": len(items)}}
+    return {"reference": {"kind": kind, "title": domain.REFERENCE_TITLES[kind], "items": items[:200], "total": len(items)}}
 
 
 # --- confirmation + execution ---------------------------------------------------------
