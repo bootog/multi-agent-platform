@@ -9,7 +9,7 @@ from app.api.routes.contact_us_history import router as contact_us_history_route
 from app.api.routes.scheduling import router as scheduling_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging
-from app.history import history_store
+from app.history import frontorder_history_store, history_store
 from app.route.agents import router as agents_router
 
 configure_logging()
@@ -19,9 +19,11 @@ configure_logging()
 async def lifespan(_: FastAPI):
     # Agent chat history (AGENT_DB_NAME): created/migrated once at startup. The API
     # still starts when it can't be reached; history then retries on later use.
-    await history_store.start()
+    await history_store.start()  # Contact agents' tables
+    await frontorder_history_store.start()  # Frontend Order Enquiry Agent's tables
     yield
     await history_store.close()
+    await frontorder_history_store.close()
 
 
 app = FastAPI(title="Multi-Agent Platform", lifespan=lifespan)

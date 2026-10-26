@@ -36,6 +36,11 @@ py -m venv .venv
 | `DB_HOST` / `DB_PORT` | `localhost` / `5432` | PostgreSQL server of the agent chat-history database |
 | `DB_USER` / `DB_PASSWORD` | – | PostgreSQL login (needs CREATEDB only if `AGENT_DB_NAME` doesn't exist yet) |
 | `AGENT_DB_NAME` | – | Dedicated chat-history database (e.g. `AgentDB`), created with its tables on startup if missing. Never the core app database |
+| `FRONTORDER_ENQUIRY_PAGE_SIZE` / `FRONTORDER_ENQUIRY_MAX_PAGES` | `50` / `5` | Enquiries per page of a provider's list / page cap for follow-up checks (hitting the cap is reported as incomplete) |
+| `FRONTORDER_ENQUIRY_SUMMARY_PAGE_SIZE` | `10` | Providers per page of the provider summary |
+| `FRONTORDER_ENQUIRY_PROVIDER_MATCH_LIMIT` | `10` | Most providers offered when a provider name is ambiguous |
+| `FRONTORDER_ENQUIRY_TIMEZONE` | `Asia/Kolkata` | Business timezone for "today" and calendar dates in chat requests |
+| `FRONTORDER_ENQUIRY_MAX_RANGE_DAYS` | `366` | Longest date range one request may ask for |
 
 ### Chat history (`app/history/store.py`)
 
@@ -216,3 +221,36 @@ The run workflow cannot ask for missing details or a confirmation, so its
 `create_customer` step ends the run as **blocked** after mapping the customer details,
 and sends nothing. Customers, B2B clients and partners are created in the chat agent
 (see Conversions above).
+
+## Frontend Order Enquiry Agent
+
+Package: `app/agents/frontorder_enquiry/` (self-contained; reuse guide in its `README.md`).
+
+`POST /api/v1/agents/frontorder-enquiry/runs` with an optional body
+`{"message": "How many enquiries came in today?", "sessionId": "<from the previous reply>", "targetProviderId": "<guid>", "page": 2}`
+→ `{runId, steps, sessionId, sessionRestarted}` (202). Requires the caller's `Authorization: Bearer`
+token (401 without one). Follow the run on `GET /api/v1/agents/runs/{runId}/events`.
+
+Provider first:
+- **No provider selected** → provider summary: one `GET OrderEnquery/GetAllOrderEnquery` call returns
+  providers ranked by their number of matching enquiries (server-side counts, paged by provider).
+- **Provider named** ("Show me Inspection Depot Inc.") → the name is looked up in Bootog's provider list
+  (`GET Provider/GetProviders`); ambiguous names get a question, unknown names get no enquiry request. Then
+  `GET OrderEnquery?targetProviderId=<id>` returns that provider's enquiries, one page at a time, with the
+  exact total.
+- **Follow-up messages** with the same `sessionId` keep the provider, dates and kind of enquiries
+  ("now show me only converted enquiries") unless the message changes them.
+- `orderAction == 6` (converted to order) is included only for converted-enquiry requests; open-enquiry and
+  follow-up requests exclude it. "Send follow-up emails" is reported as **blocked** (no email service).
+
+```
+initialize_run → understand_request → resolve_scope ─┬→ summarize_providers ──────────────────┐
+                                                      └→ fetch_enquiries → validate_enquiries  │
+                                                         → select_enquiries → [check_follow_up]│
+                                                         → prepare_enquiries ─────────→ respond
+```
+
+Every run is audited in `agent_run_audit` (AGENT_DB_NAME): steps, API calls, LLM token usage, outcomes.
+
+Full architecture, data-flow diagram, API contracts, known API limitations and the frontend contract:
+[docs/frontend-order-inquiry-architecture.md](docs/frontend-order-inquiry-architecture.md).
