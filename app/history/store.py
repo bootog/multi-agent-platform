@@ -9,7 +9,8 @@ replace the LangGraph checkpoint.
 Each store has its own pair of tables, created with the same columns:
 - `history_store`: `contact_agent_sessions` / `contact_agent_messages` (Contact agents);
 - `frontorder_history_store`: `frontorder_enquiry_sessions` / `frontorder_enquiry_messages`
-  (Frontend Order Enquiry Agent).
+  (Frontend Order Enquiry Agent), plus `frontorder_enquiry_llm_cache`: saved LLM
+  interpretations of chat messages, reused instead of calling the model again.
 
 The same database also keeps `agent_run_audit`: one row per agent run (status, timing,
 scope, LLM token usage, API calls), written by agents that record runs (the Frontend
@@ -39,6 +40,7 @@ _CONNECT_TIMEOUT_SECONDS = 10.0
 _COMMAND_TIMEOUT_SECONDS = 10.0
 _TITLE_MAX = 80
 _EMPTY_SESSION_TTL = "1 day"  # a New Chat nobody wrote in is dropped after this
+_CACHE_TTL = "7 days"  # a saved result nobody used for this long is dropped
 
 # Chat tables. {sessions} / {messages} are the table names of the store (see
 # AgentHistoryStore.__init__): each agent can keep its conversations in its own tables.
@@ -164,6 +166,31 @@ _DELETE_SESSIONS = """
      WHERE owner_id = $1 AND agent_id = $2 AND session_id = ANY($3::uuid[])
     RETURNING session_id
 """
+# Saved results (optional, see AgentHistoryStore.__init__): work that does not need to be
+# done twice, e.g. the LLM's interpretation of a chat message. `hits` counts reuses.
+CACHE_SCHEMA = (
+    """
+    CREATE TABLE IF NOT EXISTS {cache} (
+        cache_key     text        PRIMARY KEY,
+        value         jsonb       NOT NULL,
+        hits          integer     NOT NULL DEFAULT 0,
+        created_at    timestamptz NOT NULL DEFAULT now(),
+        last_used_at  timestamptz NOT NULL DEFAULT now()
+    )
+    """,
+)
+_GET_CACHED = """
+    UPDATE {cache} SET hits = hits + 1, last_used_at = now()
+     WHERE cache_key = $1
+    RETURNING value
+"""
+_SAVE_CACHED = """
+    INSERT INTO {cache} (cache_key, value) VALUES ($1, $2)
+    ON CONFLICT (cache_key) DO NOTHING
+"""
+_PRUNE_CACHED = """
+    DELETE FROM {cache} WHERE last_used_at < now() - interval '{cache_ttl}'
+"""
 _INSERT_RUN_AUDIT = """
     INSERT INTO agent_run_audit (
         run_id, agent_id, session_id, owner_id, status, intent, provider_id, date_from, date_to,
@@ -240,10 +267,15 @@ class AgentHistoryStore:
         self,
         sessions_table: str = "contact_agent_sessions",
         messages_table: str = "contact_agent_messages",
+        cache_table: str | None = None,
     ) -> None:
         # Table names are fixed in code (never user input); checked anyway because they
-        # are put into the SQL text.
-        for name in (sessions_table, messages_table):
+        # are put into the SQL text. `cache_table` is optional: without it the store keeps
+        # no saved results (get_cached always misses).
+        table_names = [sessions_table, messages_table]
+        if cache_table:
+            table_names.append(cache_table)
+        for name in table_names:
             if not re.fullmatch(r"[a-z_][a-z0-9_]*", name):
                 raise ValueError(f"Invalid table name: {name!r}")
         self.sessions_table = sessions_table
@@ -258,6 +290,13 @@ class AgentHistoryStore:
         self._get_session = _GET_SESSION.format(**names)
         self._get_messages = _GET_MESSAGES.format(**names)
         self._delete_sessions = _DELETE_SESSIONS.format(**names)
+        self.cache_table = cache_table
+        if cache_table:
+            cache_names = {"cache": cache_table, "cache_ttl": _CACHE_TTL}
+            self._schema += [statement.format(**cache_names) for statement in CACHE_SCHEMA]
+            self._get_cached = _GET_CACHED.format(**cache_names)
+            self._save_cached = _SAVE_CACHED.format(**cache_names)
+            self._prune_cached = _PRUNE_CACHED.format(**cache_names)
 
         self._settings: Settings | None = None
         self._enabled = True
@@ -461,6 +500,35 @@ class AgentHistoryStore:
             logger.warning("[AGENT_HISTORY] run=%s audit not recorded: %s", run_id, type(exc).__name__)
             return False
 
+    # --- Saved results (never raise: a miss just means the work is done again) ---
+
+    async def get_cached(self, key: str) -> dict[str, Any] | None:
+        """A saved result for `key`, or None (not saved, no cache table, or database down)."""
+        if not self.cache_table:
+            return None
+        try:
+            pool = await self._require_pool()
+            return await pool.fetchval(self._get_cached, key)
+        except HistoryUnavailable:
+            return None
+        except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, asyncio.TimeoutError) as exc:
+            logger.warning("[AGENT_HISTORY] saved result not read: %s", type(exc).__name__)
+            return None
+
+    async def save_cached(self, key: str, value: dict[str, Any]) -> None:
+        """Saves a result for `key` (the first one wins) and drops results unused for a while."""
+        if not self.cache_table:
+            return
+        try:
+            pool = await self._require_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(self._prune_cached)
+                await conn.execute(self._save_cached, key, value)
+        except HistoryUnavailable:
+            return
+        except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, asyncio.TimeoutError) as exc:
+            logger.warning("[AGENT_HISTORY] result not saved: %s", type(exc).__name__)
+
     # --- Reads and deletes for the history API (raise HistoryUnavailable) ---
 
     async def list_sessions(self, owner: str, agent: str, limit: int = 100) -> list[HistorySession]:
@@ -540,4 +608,6 @@ class AgentHistoryStore:
 
 history_store = AgentHistoryStore()
 # The Frontend Order Enquiry Agent keeps its conversations in its own tables.
-frontorder_history_store = AgentHistoryStore("frontorder_enquiry_sessions", "frontorder_enquiry_messages")
+frontorder_history_store = AgentHistoryStore(
+    "frontorder_enquiry_sessions", "frontorder_enquiry_messages", "frontorder_enquiry_llm_cache"
+)

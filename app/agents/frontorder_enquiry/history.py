@@ -1,26 +1,44 @@
-"""Chat history of the Frontend Order Enquiry Agent, stored in PostgreSQL.
+"""Conversations of the Frontend Order Enquiry Agent: who owns them, what the agent
+remembers between messages, and the stored chat history.
 
-It uses the platform's history store (app/history/store.py) with this agent's own tables,
-which have the same columns as the Contact agents' tables:
-`frontorder_enquiry_sessions` (one row per conversation) and
-`frontorder_enquiry_messages` (one row per message). Rows have
-agent_id = "frontorder-enquiry", and every query is limited to the signed-in user.
+1. Live conversations (in memory)
+   - `sessions` (the platform's ChatSessions registry, app/agents/runtime.py):
+     which caller owns a conversation, one message at a time, 4 h idle expiry.
+   - `CHECKPOINTER` (LangGraph): one thread per conversation holding the graph state
+     between messages (the `scope` and the last numbered provider list). Only the final
+     state of each message is saved, after `respond` removed the raw enquiry records.
 
-- save_user_message / save_agent_reply: every chat message and reply is stored.
-- restore_conversation: a conversation opened from the History panel (or continued after
-  a backend restart) is registered again, and the provider, dates and numbered list of
-  its last reply are put back, so replying "1" or "next page" keeps working.
-
-History is optional: when PostgreSQL is not reachable the chat still works, it is only
-not saved."""
+2. Chat history (PostgreSQL, tables frontorder_enquiry_sessions / frontorder_enquiry_messages)
+   - save_user_message / save_agent_reply: every message and reply is stored.
+   - restore_conversation: a conversation opened from the History panel (or continued
+     after a backend restart) is registered again, and the provider, dates and numbered
+     list of its last reply are put back, so replying "1" or "next page" keeps working.
+   History is optional: when PostgreSQL is not reachable the chat still works, it is
+   only not saved."""
 
 from typing import Any
 
-from app.agents.frontorder_enquiry.sessions import AGENT_KEY, sessions
+from langgraph.checkpoint.memory import InMemorySaver
+
+from app.agents.frontorder_enquiry.domain import answer_facts
+from app.agents.runtime import ChatSessions, owner_fingerprint
 from app.core.logging import get_logger
 from app.history import HistoryUnavailable, frontorder_history_store
 
 logger = get_logger(__name__)
+
+AGENT_KEY = "frontorder-enquiry"
+
+# --- 1. live conversations -------------------------------------------------------------
+
+CHECKPOINTER = InMemorySaver()
+sessions = ChatSessions(CHECKPOINTER)
+
+__all__ = ["AGENT_KEY", "CHECKPOINTER", "owner_fingerprint", "restore_conversation", "save_agent_reply",
+           "save_user_message", "sessions"]
+
+
+# --- 2. chat history (PostgreSQL) --------------------------------------------------------
 
 
 async def save_user_message(session_id: str, owner_id: str | None, message: str | None) -> None:
@@ -82,10 +100,13 @@ async def restore_conversation(session_id: str, owner_id: str, graph) -> bool:
     _, messages = found
     await sessions.restore(session_id, owner_id, AGENT_KEY)
 
-    # The newest successful reply tells us what the conversation was looking at.
+    # The newest reply that showed data (a provider list, enquiries or numbered choices)
+    # tells us what the conversation was looking at; chat replies are skipped.
     last_reply = None
     for message in reversed(messages):
-        if message.role == "assistant" and not message.is_error and message.result:
+        if message.role != "assistant" or message.is_error or not message.result:
+            continue
+        if message.result.get("view") in ("provider_summary", "provider_detail") or message.result.get("providerCandidates"):
             last_reply = message
             break
     if last_reply is None:
@@ -96,7 +117,11 @@ async def restore_conversation(session_id: str, owner_id: str, graph) -> bool:
         if not (await graph.aget_state(config)).values:
             await graph.aupdate_state(
                 config,
-                {"scope": scope_from_result(last_reply.result), "offered_providers": offered_from_result(last_reply.result)},
+                {
+                    "scope": scope_from_result(last_reply.result),
+                    "offered_providers": offered_from_result(last_reply.result),
+                    "last_answer": answer_facts(last_reply.content, last_reply.result),
+                },
                 as_node="respond",
             )
     except Exception:  # the conversation still continues, only without its earlier context

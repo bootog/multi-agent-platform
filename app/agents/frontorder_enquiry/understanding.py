@@ -1,10 +1,18 @@
 """LLM interpretation of a chat request for the Frontend Order Enquiry Agent.
 
 The LLM only classifies the message into a typed `EnquiryRequest` (what to do, which
-kind of period, which provider NAME). Dates are resolved and validated in `dates.py`,
-the provider name is looked up in Bootog in `providers.py`, and the graph decides which
-API calls to make — the LLM never builds a filter, picks an id or calls an API."""
+kind of period, which provider NAME). Dates are resolved and validated in `domain.py`,
+the provider name is looked up in Bootog in `tools.py`, and the graph decides which
+API calls to make — the LLM never builds a filter, picks an id or calls an API.
 
+Two ways the model is NOT called (or not called twice):
+- Chat messages (greetings, thanks, "what date range was that?") are answered by the model
+  in the same call, from the saved facts of the previous answer; no Bootog call is made.
+- Every interpretation is saved (table frontorder_enquiry_llm_cache). The same message on
+  the same day reuses it instead of calling the model again."""
+
+import hashlib
+import json
 import time
 from datetime import date
 from typing import Literal
@@ -15,11 +23,12 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from app.agents.frontorder_enquiry.monitoring import LlmUsage
-from app.agents.frontorder_enquiry.prompts import UNDERSTAND_SYSTEM_PROMPT
+from app.history import frontorder_history_store
 from app.llm import get_llm
+from app.prompts.frontorder_enquiry import UNDERSTAND_SYSTEM_PROMPT
 
 Action = Literal[
-    "list_enquiries", "list_followed_up", "list_not_followed_up", "list_converted", "send_follow_up", "continue", "other"
+    "list_enquiries", "list_followed_up", "list_not_followed_up", "list_converted", "send_follow_up", "continue", "chat"
 ]
 Period = Literal["none", "all", "today", "yesterday", "last_n_days", "date_range"]
 
@@ -38,6 +47,7 @@ class EnquiryRequest(BaseModel):
     needs_clarification: bool = False
     clarification_question: str | None = None
     request_summary: str = Field("", description="Neutral one-line description of the request (max 12 words).")
+    reply: str | None = Field(None, description="For action=chat only: the short reply to the user.")
 
 
 # Used when a run starts without a chat message ("Run Agent" button): open enquiries,
@@ -63,12 +73,36 @@ def _usage(raw, duration_ms: int) -> LlmUsage:
     )
 
 
-async def understand_request(config: RunnableConfig, message: str, today: date) -> tuple[EnquiryRequest, LlmUsage]:
+# --- saved interpretations --------------------------------------------------------------
+
+
+def cache_key(message: str, today: date) -> str:
+    """Same prompt + same day + same words (ignoring case and spaces) = same key. The prompt
+    is part of the key, so editing the prompt never reuses an old interpretation."""
+    words = " ".join(message.casefold().split())
+    return hashlib.sha256(f"{UNDERSTAND_SYSTEM_PROMPT}|{today.isoformat()}|{words}".encode()).hexdigest()
+
+
+# --- the model call ----------------------------------------------------------------------
+
+
+async def understand_request(
+    config: RunnableConfig, message: str, today: date, last_answer: dict | None = None
+) -> tuple[EnquiryRequest, LlmUsage | None]:
+    """Interpret one chat message. Returns (request, usage); usage is None when a saved
+    interpretation was reused, i.e. the model was not called."""
+    key = cache_key(message, today)
+    saved = await frontorder_history_store.get_cached(key)
+    if saved:
+        return EnquiryRequest.model_validate(saved), None
+
     # include_raw keeps the model's own message, which carries the token usage.
     structured = _llm(config).with_structured_output(EnquiryRequest, include_raw=True)
+    facts = json.dumps(last_answer, default=str) if last_answer else "none (this is the first question)"
     messages = [
         SystemMessage(UNDERSTAND_SYSTEM_PROMPT),
         SystemMessage(f"Today is {today.isoformat()} ({today.strftime('%A')}) in the business timezone."),
+        SystemMessage(f"Facts of the previous answer: {facts}"),
         HumanMessage(message),
     ]
     # Callbacks only: never pass the Bootog client or emitter into the model call.
@@ -81,4 +115,8 @@ async def understand_request(config: RunnableConfig, message: str, today: date) 
         raise output.get("parsing_error") or ValueError("The model returned no interpretation.")
     if not isinstance(result, EnquiryRequest):  # defensive: some providers return dicts
         result = EnquiryRequest.model_validate(result)
+
+    # A chat reply depends on the previous answer, so only data requests are saved.
+    if result.action != "chat":
+        await frontorder_history_store.save_cached(key, result.model_dump())
     return result, usage

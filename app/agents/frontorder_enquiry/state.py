@@ -24,6 +24,10 @@ class FrontOrderEnquiryAgentState(TypedDict, total=False):
     # next message can pick one by number. Each: {number, providerId, providerName}.
     # Ids come from Bootog's responses only.
     offered_providers: list[dict[str, Any]]
+    # Facts of the last answer that showed data (domain.answer_facts): counts, dates,
+    # scope. A chat question about it ("what date range was that?") is answered from
+    # these, without calling Bootog again.
+    last_answer: dict[str, Any]
 
     # --- everything below is reset at the start of every message (see graph.new_turn) ---
     run_id: str

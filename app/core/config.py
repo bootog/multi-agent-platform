@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass, field
 from functools import lru_cache
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -58,6 +59,16 @@ class Settings:
     # Latest chat messages sent to the LLM to understand a message / to write the reply.
     scheduling_understand_history_messages: int = 12
     scheduling_reply_history_messages: int = 8
+    # Frontend Order Enquiry Agent: enquiries per page of one provider's list; page cap when
+    # every enquiry must be checked (follow-up requests); business timezone for "today" and
+    # dates in chat (Bootog stores UTC); longest date range one request may ask for;
+    # providers per page of the provider summary; most providers offered for an unclear name.
+    frontorder_enquiry_page_size: int = 50
+    frontorder_enquiry_max_pages: int = 5
+    frontorder_enquiry_timezone: ZoneInfo = field(default_factory=lambda: ZoneInfo("Asia/Kolkata"))
+    frontorder_enquiry_max_range_days: int = 366
+    frontorder_enquiry_summary_page_size: int = 10
+    frontorder_enquiry_provider_match_limit: int = 10
 
     # OpenAI. The chat model drives LangGraph reasoning (understanding, extraction,
     # replies). OPENAI_REALTIME_MODEL is reserved for realtime/voice features and is
@@ -101,6 +112,12 @@ def get_settings() -> Settings:
         scheduling_order_fetch_page_size=int(os.getenv("SCHEDULING_ORDER_FETCH_PAGE_SIZE", "50")),
         scheduling_understand_history_messages=int(os.getenv("SCHEDULING_UNDERSTAND_HISTORY_MESSAGES", "12")),
         scheduling_reply_history_messages=int(os.getenv("SCHEDULING_REPLY_HISTORY_MESSAGES", "8")),
+        frontorder_enquiry_page_size=max(1, int(os.getenv("FRONTORDER_ENQUIRY_PAGE_SIZE", "50"))),
+        frontorder_enquiry_max_pages=max(1, int(os.getenv("FRONTORDER_ENQUIRY_MAX_PAGES", "5"))),
+        frontorder_enquiry_timezone=ZoneInfo(os.getenv("FRONTORDER_ENQUIRY_TIMEZONE") or "Asia/Kolkata"),
+        frontorder_enquiry_max_range_days=max(1, int(os.getenv("FRONTORDER_ENQUIRY_MAX_RANGE_DAYS", "366"))),
+        frontorder_enquiry_summary_page_size=max(1, int(os.getenv("FRONTORDER_ENQUIRY_SUMMARY_PAGE_SIZE", "10"))),
+        frontorder_enquiry_provider_match_limit=max(2, int(os.getenv("FRONTORDER_ENQUIRY_PROVIDER_MATCH_LIMIT", "10"))),
         openai_api_key=os.getenv("OPENAI_API_KEY") or None,
         openai_chat_model=os.getenv("OPENAI_CHAT_MODEL") or "gpt-4.1-mini",
         openai_temperature=_float_or_none(os.getenv("OPENAI_TEMPERATURE", "0.2")),

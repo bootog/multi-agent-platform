@@ -41,7 +41,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from app.agents.frontorder_enquiry.monitoring import RunMonitor
 from app.core.logging import get_logger
 from app.integrations.bootog.client import BootogApiError, BootogClient
 
@@ -104,7 +103,7 @@ class ProviderRef:
 
 
 @dataclass(frozen=True)
-class ProviderSearchPage:
+class ProviderLookupPage:
     # Number of providers matching the search on the server (may exceed len(providers)).
     total: int
     providers: list[ProviderRef]
@@ -141,10 +140,11 @@ def _api_datetime(value: datetime) -> str:
 
 
 class OrderEnquiryApi:
-    """Read-only Bootog calls for this agent. `monitor` (optional) records every call:
+    """Read-only Bootog calls for the Frontend Order Enquiry Agent. `monitor` (optional,
+    the agent's RunMonitor) records every call through its `api_call(...)` method:
     operation, HTTP status, duration, attempts, page and result size — never headers."""
 
-    def __init__(self, client: BootogClient, monitor: RunMonitor | None = None):
+    def __init__(self, client: BootogClient, monitor: Any = None):
         self._client = client
         self._monitor = monitor
 
@@ -291,11 +291,11 @@ class OrderEnquiryApi:
 
     # --- providers (Provider/GetProviders) --------------------------------------
 
-    async def search_providers(self, name: str, limit: int) -> ProviderSearchPage:
+    async def search_providers(self, name: str, limit: int) -> ProviderLookupPage:
         """Providers whose name contains `name` (case-insensitive), first `limit` rows."""
         text = clean_search_text(name)
         if not text:
-            return ProviderSearchPage(total=0, providers=[])
+            return ProviderLookupPage(total=0, providers=[])
         body = await self._get(
             "resolve_provider_by_name",
             PROVIDER_LIST_PATH,
@@ -382,7 +382,7 @@ def parse_provider_summary(body: Any) -> ProviderSummaryPage:
     return ProviderSummaryPage(total_providers=max(total, len(providers)), providers=providers)
 
 
-def parse_provider_list(body: Any) -> ProviderSearchPage:
+def parse_provider_list(body: Any) -> ProviderLookupPage:
     """Provider/GetProviders -> (id, name) pairs. Rows without an id or a name are skipped:
     they cannot be offered as a choice."""
     if not isinstance(body, dict) or not isinstance(body.get("data"), list):
@@ -398,4 +398,4 @@ def parse_provider_list(body: Any) -> ProviderSearchPage:
             place = [" ".join(str(row.get(k) or "").split()) for k in ("city", "state")]
             providers.append(ProviderRef(provider_id, name, ", ".join(p for p in place if p) or None))
     total = _int_or_none(body.get("count"))
-    return ProviderSearchPage(total=max(total or 0, len(providers)), providers=providers)
+    return ProviderLookupPage(total=max(total or 0, len(providers)), providers=providers)
