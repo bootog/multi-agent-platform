@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 
 from app.agents.contact_us.modules import AGENT_KEY_PATTERN
@@ -47,17 +47,43 @@ class ChatTurnRequest(CamelModel):
     agent_label: str | None = Field(None, max_length=80)
     # A chat card's structured form (address details, "Create customer").
     form: "ChatFormSubmission | None" = None
+    # The signed-in user's BOOTOG user id, from the host's session (RoleContext.userId). Used
+    # only to filter "requests assigned to me"; BOOTOG still applies the caller's own access.
+    viewer_user_id: str | None = Field(None, pattern=r"^[0-9a-fA-F-]{36}$")
+
+
+class ChatFormFile(CamelModel):
+    """An image picked on the card (Partner Company Logo / User Headshot), base64 encoded.
+    Its type and size are checked on the content (conversions.read_upload)."""
+
+    name: str = Field(..., min_length=1, max_length=255)
+    data: str = Field(..., min_length=1, max_length=2_800_000)  # base64 of at most 2 MB
 
 
 class ChatFormSubmission(CamelModel):
     """A structured form submitted from a chat card, sent with (or instead of) a message.
     The backend merges and validates it exactly like typed details."""
 
-    # submit_details: the details form; create: "Create customer" on a ready summary.
-    action: Literal["submit_details", "create"]
-    # The request the card belongs to; a form for another request is refused.
-    request_id: str = Field(..., min_length=1, max_length=64)
+    # submit_details: the details form; create: "Create customer" on a ready summary;
+    # apply_filters: the request list's filter card (statuses, createdFrom, createdTo,
+    # providerId, assignedUserId, allStatuses, page in `fields`); status_change: the status
+    # card (token, decision confirm|cancel, status, comment).
+    action: Literal["submit_details", "create", "apply_filters", "status_change"]
+    # The request the card belongs to; a form for another request is refused. Not used by
+    # apply_filters (the filters belong to the list, not to a request).
+    request_id: str = Field("", max_length=64)
     fields: dict[str, str] = Field(default_factory=dict, max_length=30)
+    # The card's conversion (customer, b2b_client, ...): lets the form be applied after the
+    # conversation's saved state was lost. Never trusted beyond the known types.
+    conversion_type: str | None = Field(None, max_length=40)
+    # Images changed on the card: a new file, or null to remove the attached one.
+    files: dict[Literal["logo", "headshot"], ChatFormFile | None] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _request_for_details(self) -> "ChatFormSubmission":
+        if self.action in ("submit_details", "create") and not self.request_id:
+            raise ValueError("request_id is required for this form")
+        return self
 
 
 class ChatTurnStarted(CamelModel):

@@ -9,7 +9,8 @@ GET /Provider/SearchProviders?providerType=1&providerName=<prefix>&page=1&pageSi
 -> [ProviderSearchModel, ...]  (a plain array, no count). The service matches
 `ProviderName ILIKE '<providerName>%'` (prefix only) and has no location parameter;
 a short page means the end of the list. This is the "Select Service Provider" list
-of the B2B / Partner screens (app-provider-select).
+of the B2B / Partner screens (app-provider-select). A blank providerName is shown as
+the row's userName; a row with neither is skipped.
 
 POST /Provider/SaveProviderVendor {"vendorId", "targetProviderId"} -> Result. Inserts
 the (provider, vendor) link only when it doesn't exist yet, so repeating it is safe.
@@ -108,9 +109,10 @@ class ProviderApi:
             if not isinstance(row, dict):
                 continue
             provider_id = row.get("providerId")
-            name = " ".join(str(row.get("providerName") or "").split())
+            # A provider without a company name is listed under its user name.
+            name = " ".join(str(row.get("providerName") or "").split()) or " ".join(str(row.get("userName") or "").split())
             if not isinstance(provider_id, str) or not provider_id or not name:
-                continue  # a blank name can't be offered as a choice
+                continue  # no name at all can't be offered as a choice
             out.append(
                 ProviderSearchResult(
                     provider_id=provider_id,

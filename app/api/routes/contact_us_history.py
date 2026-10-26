@@ -99,3 +99,13 @@ async def delete_chat_history(request: DeleteHistoryRequest, authorization: str 
             sessions.end(live)
             await sessions.delete(live)
     return DeleteHistoryResult(deleted_session_ids=deleted, deleted_count=len(deleted))
+
+
+
+@router.get("/health/live")
+async def health_check_live():
+    return {"status": "ok"}
+
+@router.get("/health/ready")
+async def health_check_ready():
+    return {"status": "ok"}

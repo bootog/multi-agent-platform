@@ -92,6 +92,15 @@ class ContactUsChatState(ContactUsAgentState, total=False):
     explicit_create: bool  # this turn explicitly asked to create the account now
     completed_this_turn: bool  # this turn's values completed a draft that was incomplete
     rejected_field_updates: dict[str, str]  # label -> why; the previous value was kept
+    rejected_uploads: dict[str, str]  # upload label -> why; the attached image (if any) was kept
+    filter_problems: list[str]  # list filters that could not be applied: nothing is listed, the user is asked
+    filters_before: dict[str, Any] | None  # active_filters before this turn (restored when the assignee can't be resolved)
+    viewer_user_id: str | None  # the signed-in user's BOOTOG id, from the host's session ("my requests")
+    status_targets: list[str] | None  # request ids a status change names by list number this turn
+    status_request: dict[str, Any] | None  # this turn's change_status ask: {status, comment}
+    status_change_confirmed: bool  # this turn confirms the pending status change (chat "yes" or the card)
+    history: dict[str, Any] | None  # the tracking history read this turn (card + facts)
+    company_pick: dict[str, str] | None  # a company chosen from the offered ones (card or number)
     post_creation_edit: list[str]  # labels the user tried to change after the account existed
     edit_request: dict[str, Any] | None  # "I need to change my address" (no value yet)
 
@@ -105,8 +114,24 @@ class ContactUsChatState(ContactUsAgentState, total=False):
     #   created_vendor_id, user_id, completed [steps], failed {step, message, outcome_unknown}
     conversion: dict[str, Any] | None
     assigned_users_cache: dict[str, Any] | None  # {"at": epoch seconds, "users": [{id, name}]}
+    # The request-list filters in force, kept across turns so follow-ups only change what
+    # they name: {statuses [int], all_statuses, only_open, created_from, created_to,
+    # assigned_user_name, assigned_user_ids, page}. The company is `provider_id/_name`.
+    active_filters: dict[str, Any] | None
+    # SearchProviders (the Contact Us screen's company filter list): {"at", "providers", "truncated"}.
+    provider_catalog: dict[str, Any] | None
+    company_candidates: list[dict[str, str]] | None  # offered when a company name matched several
+    assignee_candidates: list[dict[str, str]] | None  # offered when an assignee name matched several / none
+    # A status change waiting for (or just past) confirmation. Ids and names come from BOOTOG
+    # records only: {token, ids, requests [{id, name, status}], status, comment, state,
+    # changed, failed, message}. Executed only for this token, once.
+    status_change: dict[str, Any] | None
     listed_request_ids: list[str]  # order of the requests last shown to the user
     user_customer_fields: dict[str, str]  # values the user supplied (latest wins)
+    # Images attached on the card for one request: {"request_id", "files": {key: {name,
+    # content_type, size, sha, data (base64; dropped once sent with the account)}}}.
+    # Kept apart from `conversion`, whose content is described to the LLM.
+    conversion_files: dict[str, Any] | None
     known_fields: list[str]
     invalid_fields: dict[str, str]
     extra_information: dict[str, str]  # useful info outside the API schema; never sent

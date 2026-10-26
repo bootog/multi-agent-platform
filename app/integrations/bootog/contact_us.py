@@ -21,7 +21,15 @@ without its operator characters are ever interpolated.
 
 Other calls used by the agent:
 GET /ContactUs/GetContactUsAssignedUser?filter=(moduleName=...)  -> [{assignedUserId, assignedUserName}]
-PUT /ContactUs/bulk-update-file {"updateValues": {...}, "ids": [...]} -> {"message": ...}"""
+PUT /ContactUs/bulk-update-file {"updateValues": {...}, "ids": [...]} -> {"message": ...}
+GET /ContactUs/GetContactUsTrackingHistory?filter=contactUsId=<ContactUs id>&page&pageSize&orderBy=createdDate desc
+    -> {"count", "data": [{contactUsId, contactUsStatus, statusComments, note, userName,
+       createdByUserName, dateOfContact, timeOfContact, followUpNeeded, dateOfFollowUp,
+       timeOfFollowUp, emailTo, smsTo, createdDateTime, id, ...}]}  (contact-us.component.ts
+       getTrackingHistory: the row's own `id` is the contactUsId)
+POST /ContactUs/ChangeStatus {"status", "ids": [...], "comments"?} -> Result {value: [changed ids], failed,
+    message, failures, exception}. The Change Status popup (change-status-popup.component.ts)
+    sends the comment with it; it becomes the history entry's statusComments."""
 
 import re
 from dataclasses import dataclass
@@ -29,7 +37,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from app.core.logging import get_logger
-from app.integrations.bootog.client import BootogApiError, BootogClient
+from app.integrations.bootog.client import BootogApiError, BootogClient, check_result
 
 logger = get_logger(__name__)
 
@@ -197,6 +205,38 @@ class ContactUsApi:
             if isinstance(user_id, str) and user_id and name and user_id not in users:
                 users[user_id] = AssignedUser(user_id, name)
         return sorted(users.values(), key=lambda u: u.user_name.casefold())
+
+    async def tracking_history(self, contact_us_id: str, page_size: int) -> tuple[int, list[dict[str, Any]]]:
+        """-> (count, entries newest first). Raises on HTTP errors and on an answer that
+        isn't the documented {count, data} shape: a malformed answer is never "no history"."""
+        if not _SAFE_ID.match(contact_us_id or ""):
+            raise ValueError("a valid Contact Us id is required")
+        body = await self._client.get(
+            "ContactUs/GetContactUsTrackingHistory",
+            params={"filter": f"contactUsId={contact_us_id}", "page": 1, "pageSize": page_size, "orderBy": "createdDate desc"},
+        )
+        rows = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(rows, list):
+            raise BootogApiError("BOOTOG returned the request history in an unexpected format.")
+        entries = [r for r in rows if isinstance(r, dict) and r.get("contactUsId") in (None, contact_us_id)]
+        entries.sort(key=lambda r: str(r.get("createdDateTime") or ""), reverse=True)
+        try:
+            count = int(body.get("count") or 0)
+        except (TypeError, ValueError):
+            count = len(entries)
+        return max(count, len(entries)), entries
+
+    async def change_status(self, ids: list[str], status: int, comments: str | None = None) -> list[str]:
+        """POST ChangeStatus; -> the ids BOOTOG reports as changed (`value`). Raises when it
+        answers failed:true (BootogResultError) or with an HTTP error. Sent exactly once."""
+        if not ids or not all(isinstance(i, str) and _SAFE_ID.match(i) for i in ids):
+            raise ValueError("valid Contact Us ids are required")
+        payload: dict[str, Any] = {"status": int(status), "ids": ids}
+        if comments:
+            payload["comments"] = comments
+        body = check_result(await self._client.post("ContactUs/ChangeStatus", json=payload), "Changing the status")
+        value = body.get("value")
+        return [i for i in value if i in ids] if isinstance(value, list) else []
 
     async def update_requests(self, ids: list[str], values: dict[str, Any]) -> dict[str, Any]:
         """PUT bulk-update-file. Keys are ContactUsInfo column names (case-sensitive).
