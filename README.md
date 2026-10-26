@@ -72,6 +72,25 @@ Interactions worth knowing before changing them:
   24; `SCHEDULING_SLOTS_PER_DAY` above 24 has no effect. The LLM sees at most the first 15 slots
   overall; the result card shows every day.
 
+Settings are read once at startup from the environment; `.env` is loaded for local development
+and a real environment variable always wins over it. Every `SCHEDULING_*` setting takes a whole
+number: a non-integer value (including a decimal such as `30.5`) stops startup with a
+`ValueError`. No range is checked at startup; out-of-range values are handled where they are used,
+as described in the table. For `SCHEDULING_MAX_SLOT_DAYS`, `SCHEDULING_SLOTS_PER_DAY`,
+`SCHEDULING_ORDER_FETCH_PAGE_SIZE` and the two `*_HISTORY_MESSAGES` settings, `0` or a negative
+value is treated as `1`.
+
+Interactions worth knowing before changing them:
+
+- A chat order list reads at most `SCHEDULING_ORDER_FETCH_PAGE_SIZE` × `BOOTOG_MAX_PAGES` orders
+  (500 by default). A longer list is marked truncated, and a multi-order assignment refuses a
+  truncated list. `BOOTOG_MAX_PAGES` is shared with the Contact Us agents.
+- The largest `pageSize` Bootog accepts for `GetOrderDetails` has not been verified.
+- Chat history keeps the latest 40 messages, so `*_HISTORY_MESSAGES` values above 40 have no effect.
+- Slots are on a 60-minute grid inside the producer's working hours, so a day never has more than
+  24; `SCHEDULING_SLOTS_PER_DAY` above 24 has no effect. The LLM sees at most the first 15 slots
+  overall; the result card shows every day.
+
 ### Chat history (`app/history/store.py`)
 
 One database (`AGENT_DB_NAME`), two tables: `contact_agent_sessions` (one row per
