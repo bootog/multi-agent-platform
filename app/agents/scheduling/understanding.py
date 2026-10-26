@@ -11,29 +11,14 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from app.agents.contact_us.state import ChatMessage
-from app.agents.scheduling.domain import CALLER_TYPES, RESPONSE_RESULTS
+from app.agents.scheduling.domain import CALLER_TYPES, LOG_CHANNELS, PERSON_TYPES, REFERENCE_TITLES, RESPONSE_RESULTS
+from app.core.config import get_settings
 from app.llm import get_llm
 from app.prompts.scheduling import RESPOND_SYSTEM_PROMPT, UNDERSTAND_SYSTEM_PROMPT
 
-Intent = Literal[
-    "greeting_or_help",
-    "order_summary",
-    "list_orders",
-    "find_order",
-    "order_details",
-    "find_producers",
-    "assign_order",
-    "assign_orders",
-    "check_availability",
-    "schedule_order",
-    "add_log",
-    "list_logs",
-    "list_reference",
-    "confirm_action",
-    "cancel_action",
-    "other",
-]
-
+# The supported intents, in the order the model sees them. `Intent` is built from these
+# keys, so an intent is added here (plus its tool in graph.INTENT_TOOLS and its line in
+# the prompt) and nowhere else.
 INTENT_LABELS: dict[str, str] = {
     "greeting_or_help": "Conversation",
     "order_summary": "Order status summary",
@@ -53,8 +38,12 @@ INTENT_LABELS: dict[str, str] = {
     "other": "General question",
 }
 
+Intent = Literal[tuple(INTENT_LABELS)]  # type: ignore[valid-type]
 ResponseResult = Literal[tuple(RESPONSE_RESULTS)]  # type: ignore[valid-type]
 CallerType = Literal[tuple(CALLER_TYPES)]  # type: ignore[valid-type]
+LogChannel = Literal[tuple(LOG_CHANNELS)]  # type: ignore[valid-type]
+Direction = Literal[tuple(PERSON_TYPES)]  # type: ignore[valid-type]
+ReferenceKind = Literal[tuple(REFERENCE_TITLES)]  # type: ignore[valid-type]
 
 
 class OrderReference(BaseModel):
@@ -100,7 +89,7 @@ class SlotChoice(BaseModel):
 
 
 class LogDetails(BaseModel):
-    channel: Literal["phone_call", "sms", "email", "note"] | None = None
+    channel: LogChannel | None = None  # type: ignore[valid-type]
     party: Literal["customer", "producer"] | None = Field(None, description="Who was contacted: the customer or the inspector/producer.")
     message: str | None = Field(None, description="What was said / the notes / the message body.")
     subject: str | None = Field(None, description="Email subject.")
@@ -109,7 +98,7 @@ class LogDetails(BaseModel):
     email_to: str | None = None
     response_result: ResponseResult | None = Field(None, description="Phone call result.")  # type: ignore[valid-type]
     caller_type: CallerType | None = Field(None, description="Who the call was with.")  # type: ignore[valid-type]
-    direction: Literal["inbound", "outbound"] | None = None
+    direction: Direction | None = None  # type: ignore[valid-type]
 
 
 class OrderGroupAssignment(BaseModel):
@@ -123,14 +112,14 @@ class OrderGroupAssignment(BaseModel):
 
 
 class TurnUnderstanding(BaseModel):
-    intent: Intent
+    intent: Intent  # type: ignore[valid-type]
     summary: str = Field(description="Neutral one-line description of the request (max 12 words).")
     order: OrderReference | None = None
     filters: OrderFilters | None = None
     producer: ProducerReference | None = None
     slot: SlotChoice | None = None
     log: LogDetails | None = None
-    reference_kind: Literal["service_types", "programs", "time_zones", "order_statuses", "sub_statuses", "providers"] | None = None
+    reference_kind: ReferenceKind | None = None  # type: ignore[valid-type]
     schedule_comments: str | None = Field(None, description="Comments for the appointment, when given.")
     max_distance_miles: float | None = Field(None, description="Distance limit for producers, e.g. 30 for 'within 30 miles'.")
     reassign: bool = Field(False, description="The user explicitly wants to replace the producer already assigned.")
@@ -144,6 +133,8 @@ def _llm(config: RunnableConfig) -> BaseChatModel:
 
 
 def _history(messages: list[ChatMessage], limit: int) -> list[BaseMessage]:
+    # At least the latest message: `messages[-0:]` would be the whole conversation.
+    limit = max(1, limit)
     return [HumanMessage(m["content"]) if m["role"] == "user" else AIMessage(m["content"]) for m in messages[-limit:]]
 
 
@@ -161,7 +152,7 @@ async def understand(config: RunnableConfig, history: list[ChatMessage], context
     messages: list[BaseMessage] = [
         SystemMessage(UNDERSTAND_SYSTEM_PROMPT),
         SystemMessage(f"Current agent state:\n{_json(context)}"),
-        *_history(history, 12),
+        *_history(history, get_settings().scheduling_understand_history_messages),
     ]
     result = await structured.ainvoke(messages, config=_child(config))
     if not isinstance(result, TurnUnderstanding):
@@ -172,7 +163,7 @@ async def understand(config: RunnableConfig, history: list[ChatMessage], context
 async def compose_reply(config: RunnableConfig, history: list[ChatMessage], facts: dict[str, Any]) -> str:
     messages: list[BaseMessage] = [
         SystemMessage(RESPOND_SYSTEM_PROMPT),
-        *_history(history, 8),
+        *_history(history, get_settings().scheduling_reply_history_messages),
         SystemMessage(f"Facts for this turn:\n{_json(facts)}"),
     ]
     reply = await _llm(config).ainvoke(messages, config=_child(config))

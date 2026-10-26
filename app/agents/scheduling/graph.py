@@ -28,6 +28,7 @@ from app.agents.runtime import RunChannel
 from app.agents.scheduling import domain, nodes
 from app.agents.scheduling.nodes import ACTIVITY_TITLES
 from app.agents.scheduling.state import SchedulingChatState
+from app.agents.scheduling.understanding import INTENT_LABELS
 from app.core.logging import get_logger
 from app.integrations.bootog import BootogClient
 
@@ -67,6 +68,20 @@ INTENT_TOOLS = {
     "confirm_action": "execute_action",
     "cancel_action": "cancel_action",
 }
+
+
+def _check_routing() -> None:
+    """Fails at import when the intent tables drift apart: every routed intent (from the LLM
+    or a chat card) must be a supported intent, and every route must reach a tool node.
+    Intents without a route (greeting_or_help, other) go straight to `respond`."""
+    unknown = (set(INTENT_TOOLS) | set(nodes._ACTION_INTENTS.values())) - set(INTENT_LABELS)
+    missing = set(INTENT_TOOLS.values()) - set(TOOLS)
+    if unknown or missing:
+        raise RuntimeError(f"Scheduling routing is inconsistent: unknown intents {sorted(unknown)}, "
+                           f"unknown tool nodes {sorted(missing)}")
+
+
+_check_routing()
 
 
 def route(state: SchedulingChatState) -> str:
