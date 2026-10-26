@@ -38,6 +38,26 @@ class Settings:
     # client.py). Only "Mobile" is accepted (the gateway then skips that check) and only
     # with the Bootog team's authorisation; anything else is ignored with a warning.
     bootog_client_type: str | None = None
+    # Scheduling Agent: orders per page in chat, days of appointment slots offered, and
+    # the producer search radius (miles) around the property.
+    scheduling_page_size: int = 10
+    scheduling_slot_days: int = 5
+    scheduling_producer_radius_miles: int = 30
+    # Multi-order "nearest eligible" search: when nothing eligible is found, the radius grows
+    # by this step until a producer is found or the maximum is reached.
+    scheduling_radius_step_miles: int = 30
+    scheduling_max_radius_miles: int = 120
+    # Most orders one multi-order assignment may cover (each order is validated and written
+    # on its own, so this bounds the API calls one confirmation can trigger).
+    scheduling_max_batch_orders: int = 50
+    # Most days of appointment slots one request may ask for, and open slots shown per day.
+    scheduling_max_slot_days: int = 14
+    scheduling_slots_per_day: int = 8
+    # Orders read per GetOrderDetails call when the chat lists every matching order.
+    scheduling_order_fetch_page_size: int = 50
+    # Latest chat messages sent to the LLM to understand a message / to write the reply.
+    scheduling_understand_history_messages: int = 12
+    scheduling_reply_history_messages: int = 8
 
     # OpenAI. The chat model drives LangGraph reasoning (understanding, extraction,
     # replies). OPENAI_REALTIME_MODEL is reserved for realtime/voice features and is
@@ -70,6 +90,17 @@ def get_settings() -> Settings:
         bootog_retry_backoff_seconds=float(os.getenv("BOOTOG_RETRY_BACKOFF_SECONDS", "0.3")),
         bootog_max_pages=int(os.getenv("BOOTOG_MAX_PAGES", "10")),
         bootog_client_type=(os.getenv("BOOTOG_CLIENT_TYPE") or "").strip() or None,
+        scheduling_page_size=int(os.getenv("SCHEDULING_PAGE_SIZE", "10")),
+        scheduling_slot_days=int(os.getenv("SCHEDULING_SLOT_DAYS", "5")),
+        scheduling_producer_radius_miles=int(os.getenv("SCHEDULING_PRODUCER_RADIUS_MILES", "30")),
+        scheduling_radius_step_miles=int(os.getenv("SCHEDULING_RADIUS_STEP_MILES", "30")),
+        scheduling_max_radius_miles=int(os.getenv("SCHEDULING_MAX_RADIUS_MILES", "120")),
+        scheduling_max_batch_orders=int(os.getenv("SCHEDULING_MAX_BATCH_ORDERS", "50")),
+        scheduling_max_slot_days=int(os.getenv("SCHEDULING_MAX_SLOT_DAYS", "14")),
+        scheduling_slots_per_day=int(os.getenv("SCHEDULING_SLOTS_PER_DAY", "8")),
+        scheduling_order_fetch_page_size=int(os.getenv("SCHEDULING_ORDER_FETCH_PAGE_SIZE", "50")),
+        scheduling_understand_history_messages=int(os.getenv("SCHEDULING_UNDERSTAND_HISTORY_MESSAGES", "12")),
+        scheduling_reply_history_messages=int(os.getenv("SCHEDULING_REPLY_HISTORY_MESSAGES", "8")),
         openai_api_key=os.getenv("OPENAI_API_KEY") or None,
         openai_chat_model=os.getenv("OPENAI_CHAT_MODEL") or "gpt-4.1-mini",
         openai_temperature=_float_or_none(os.getenv("OPENAI_TEMPERATURE", "0.2")),

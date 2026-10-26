@@ -3,6 +3,7 @@ from app.history.store import (
     HistoryMessage,
     HistorySession,
     HistoryUnavailable,
+    frontorder_history_store,
     history_store,
     session_uuid,
 )
@@ -12,6 +13,7 @@ __all__ = [
     "HistoryMessage",
     "HistorySession",
     "HistoryUnavailable",
+    "frontorder_history_store",
     "history_store",
     "session_uuid",
 ]

@@ -25,9 +25,10 @@ def canonical_session_id(session_id: str | None) -> str | None:
     return sid.hex if sid else session_id
 
 
-async def restore_session(session_id: str, owner: str, agent: str, graph=None) -> bool:
+async def restore_session(session_id: str, owner: str, agent: str, graph=None, registry=None) -> bool:
     """Re-registers a conversation from history. False if it isn't this caller's
-    conversation with this agent (or history is unavailable)."""
+    conversation with this agent (or history is unavailable). Other chat agents pass
+    their own `graph` and session `registry`; the defaults are the Contact agents'."""
     try:
         found = await history_store.get_session(session_id, owner, agent)
     except HistoryUnavailable:
@@ -35,7 +36,7 @@ async def restore_session(session_id: str, owner: str, agent: str, graph=None) -
     if found is None:
         return False
     _, messages = found
-    await sessions.restore(session_id, owner, agent)
+    await (registry or sessions).restore(session_id, owner, agent)
 
     graph = graph or CONTACT_US_CHAT_GRAPH
     config = {"configurable": {"thread_id": session_id}}

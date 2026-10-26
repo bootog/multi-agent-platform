@@ -1,10 +1,19 @@
 """Agent chat history: conversations and their messages, kept in the dedicated
 AGENT_DB_NAME database — never in the core application database.
 
-One database holds every conversation. A conversation is one row in
-`contact_agent_sessions`, keyed by its session_id (the same id the chat API and the
-LangGraph thread use); its messages are rows in `contact_agent_messages`. History is a
-record of what was said; it does not replace the LangGraph checkpoint.
+One database holds every conversation. A conversation is one row in a sessions table,
+keyed by its session_id (the same id the chat API and the LangGraph thread use); its
+messages are rows in a messages table. History is a record of what was said; it does not
+replace the LangGraph checkpoint.
+
+Each store has its own pair of tables, created with the same columns:
+- `history_store`: `contact_agent_sessions` / `contact_agent_messages` (Contact agents);
+- `frontorder_history_store`: `frontorder_enquiry_sessions` / `frontorder_enquiry_messages`
+  (Frontend Order Enquiry Agent).
+
+The same database also keeps `agent_run_audit`: one row per agent run (status, timing,
+scope, LLM token usage, API calls), written by agents that record runs (the Frontend
+Order Enquiry Agent).
 
 History is optional at runtime: when PostgreSQL is unreachable or misconfigured the
 chat keeps working without it, and initialization is retried on later use."""
@@ -15,7 +24,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 import asyncpg
@@ -31,9 +40,11 @@ _COMMAND_TIMEOUT_SECONDS = 10.0
 _TITLE_MAX = 80
 _EMPTY_SESSION_TTL = "1 day"  # a New Chat nobody wrote in is dropped after this
 
-SCHEMA = (
+# Chat tables. {sessions} / {messages} are the table names of the store (see
+# AgentHistoryStore.__init__): each agent can keep its conversations in its own tables.
+CHAT_SCHEMA = (
     """
-    CREATE TABLE IF NOT EXISTS contact_agent_sessions (
+    CREATE TABLE IF NOT EXISTS {sessions} (
         session_id  uuid        PRIMARY KEY,
         agent_id    text        NOT NULL,
         owner_id    text        NOT NULL,
@@ -43,13 +54,13 @@ SCHEMA = (
     )
     """,
     """
-    CREATE INDEX IF NOT EXISTS contact_agent_sessions_owner_idx
-        ON contact_agent_sessions (owner_id, agent_id, updated_at DESC)
+    CREATE INDEX IF NOT EXISTS {sessions}_owner_idx
+        ON {sessions} (owner_id, agent_id, updated_at DESC)
     """,
     """
-    CREATE TABLE IF NOT EXISTS contact_agent_messages (
+    CREATE TABLE IF NOT EXISTS {messages} (
         id          bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-        session_id  uuid        NOT NULL REFERENCES contact_agent_sessions (session_id) ON DELETE CASCADE,
+        session_id  uuid        NOT NULL REFERENCES {sessions} (session_id) ON DELETE CASCADE,
         role        text        NOT NULL CHECK (role IN ('user', 'assistant')),
         content     text        NOT NULL,
         result      jsonb,
@@ -58,15 +69,50 @@ SCHEMA = (
     )
     """,
     """
-    CREATE INDEX IF NOT EXISTS contact_agent_messages_session_idx
-        ON contact_agent_messages (session_id, created_at, id)
+    CREATE INDEX IF NOT EXISTS {messages}_session_idx
+        ON {messages} (session_id, created_at, id)
+    """,
+)
+
+# Shared by every agent (rows are told apart by agent_id).
+AUDIT_SCHEMA = (
+    # One row per agent run: status, timing, scope, LLM token usage and a sanitized
+    # `detail` (steps, API calls, model calls, business outcomes). Never tokens,
+    # headers or customer contact details. Token columns are NULL when the model
+    # integration did not report usage (unavailable, not zero).
+    """
+    CREATE TABLE IF NOT EXISTS agent_run_audit (
+        run_id         text        PRIMARY KEY,
+        agent_id       text        NOT NULL,
+        session_id     text,
+        owner_id       text        NOT NULL,
+        status         text        NOT NULL,
+        intent         text,
+        provider_id    text,
+        date_from      date,
+        date_to        date,
+        started_at     timestamptz NOT NULL,
+        finished_at    timestamptz NOT NULL,
+        duration_ms    integer     NOT NULL,
+        llm_calls      integer     NOT NULL DEFAULT 0,
+        input_tokens   integer,
+        output_tokens  integer,
+        total_tokens   integer,
+        detail         jsonb       NOT NULL,
+        error          text,
+        created_at     timestamptz NOT NULL DEFAULT now()
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS agent_run_audit_owner_idx
+        ON agent_run_audit (owner_id, agent_id, started_at DESC)
     """,
 )
 
 # Owner + agent scope every statement: a caller only ever sees or changes their own
 # conversations with this agent.
 _UPSERT_SESSION = """
-    INSERT INTO contact_agent_sessions AS s (session_id, agent_id, owner_id, title)
+    INSERT INTO {sessions} AS s (session_id, agent_id, owner_id, title)
     VALUES ($1, $2, $3, $4)
     ON CONFLICT (session_id) DO UPDATE
        SET updated_at = now(), title = COALESCE(s.title, EXCLUDED.title)
@@ -74,28 +120,28 @@ _UPSERT_SESSION = """
     RETURNING session_id, created_at
 """
 _TOUCH_SESSION = """
-    UPDATE contact_agent_sessions SET updated_at = now()
+    UPDATE {sessions} SET updated_at = now()
      WHERE session_id = $1 AND owner_id = $2 AND agent_id = $3
     RETURNING session_id
 """
 _INSERT_MESSAGE = """
-    INSERT INTO contact_agent_messages (session_id, role, content, result, is_error)
+    INSERT INTO {messages} (session_id, role, content, result, is_error)
     VALUES ($1, $2, $3, $4, $5)
 """
-_PRUNE_EMPTY = f"""
-    DELETE FROM contact_agent_sessions s
+_PRUNE_EMPTY = """
+    DELETE FROM {sessions} s
      WHERE s.owner_id = $1 AND s.agent_id = $2
-       AND s.updated_at < now() - interval '{_EMPTY_SESSION_TTL}'
-       AND NOT EXISTS (SELECT 1 FROM contact_agent_messages m WHERE m.session_id = s.session_id)
+       AND s.updated_at < now() - interval '{ttl}'
+       AND NOT EXISTS (SELECT 1 FROM {messages} m WHERE m.session_id = s.session_id)
 """
 # Conversations without messages (a New Chat not used yet) are not history.
 _LIST_SESSIONS = """
     SELECT s.session_id, s.title, s.created_at, s.updated_at, count(m.id) AS message_count,
-           (SELECT f.content FROM contact_agent_messages f
+           (SELECT f.content FROM {messages} f
              WHERE f.session_id = s.session_id AND f.role = 'user'
              ORDER BY f.created_at, f.id LIMIT 1) AS first_message
-      FROM contact_agent_sessions s
-      JOIN contact_agent_messages m ON m.session_id = s.session_id
+      FROM {sessions} s
+      JOIN {messages} m ON m.session_id = s.session_id
      WHERE s.owner_id = $1 AND s.agent_id = $2
      GROUP BY s.session_id
      ORDER BY s.updated_at DESC
@@ -103,20 +149,28 @@ _LIST_SESSIONS = """
 """
 _GET_SESSION = """
     SELECT session_id, title, created_at, updated_at
-      FROM contact_agent_sessions
+      FROM {sessions}
      WHERE session_id = $1 AND owner_id = $2 AND agent_id = $3
 """
 _GET_MESSAGES = """
     SELECT id, role, content, result, is_error, created_at
-      FROM contact_agent_messages
+      FROM {messages}
      WHERE session_id = $1
      ORDER BY created_at, id
      LIMIT $2
 """
 _DELETE_SESSIONS = """
-    DELETE FROM contact_agent_sessions
+    DELETE FROM {sessions}
      WHERE owner_id = $1 AND agent_id = $2 AND session_id = ANY($3::uuid[])
     RETURNING session_id
+"""
+_INSERT_RUN_AUDIT = """
+    INSERT INTO agent_run_audit (
+        run_id, agent_id, session_id, owner_id, status, intent, provider_id, date_from, date_to,
+        started_at, finished_at, duration_ms, llm_calls, input_tokens, output_tokens, total_tokens,
+        detail, error)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+    ON CONFLICT (run_id) DO NOTHING
 """
 
 
@@ -169,6 +223,10 @@ def title_from(message: str | None) -> str | None:
     return (cut.rsplit(" ", 1)[0] if " " in cut[20:] else cut).rstrip(" ,.;:-") + "…"
 
 
+def _date_or_none(value: str | None) -> date | None:
+    return date.fromisoformat(value) if value else None
+
+
 def _quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
@@ -178,7 +236,29 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 
 
 class AgentHistoryStore:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        sessions_table: str = "contact_agent_sessions",
+        messages_table: str = "contact_agent_messages",
+    ) -> None:
+        # Table names are fixed in code (never user input); checked anyway because they
+        # are put into the SQL text.
+        for name in (sessions_table, messages_table):
+            if not re.fullmatch(r"[a-z_][a-z0-9_]*", name):
+                raise ValueError(f"Invalid table name: {name!r}")
+        self.sessions_table = sessions_table
+        self.messages_table = messages_table
+        names = {"sessions": sessions_table, "messages": messages_table, "ttl": _EMPTY_SESSION_TTL}
+        self._schema = [statement.format(**names) for statement in CHAT_SCHEMA] + list(AUDIT_SCHEMA)
+        self._upsert_session = _UPSERT_SESSION.format(**names)
+        self._touch_session = _TOUCH_SESSION.format(**names)
+        self._insert_message = _INSERT_MESSAGE.format(**names)
+        self._prune_empty = _PRUNE_EMPTY.format(**names)
+        self._list_sessions = _LIST_SESSIONS.format(**names)
+        self._get_session = _GET_SESSION.format(**names)
+        self._get_messages = _GET_MESSAGES.format(**names)
+        self._delete_sessions = _DELETE_SESSIONS.format(**names)
+
         self._settings: Settings | None = None
         self._enabled = True
         self._pool: asyncpg.Pool | None = None
@@ -214,7 +294,10 @@ class AgentHistoryStore:
             if self._pool is None:
                 self._next_attempt = time.monotonic() + _RETRY_SECONDS
                 return False
-            logger.info("[AGENT_HISTORY] chat history ready (database %s)", settings.agent_db_name)
+            logger.info(
+                "[AGENT_HISTORY] chat history ready (database %s, tables %s / %s)",
+                settings.agent_db_name, self.sessions_table, self.messages_table,
+            )
             return True
 
     async def close(self) -> None:
@@ -245,7 +328,7 @@ class AgentHistoryStore:
             raise HistoryConfigError(f"PostgreSQL rejected DB_USER/DB_PASSWORD ({type(exc).__name__}).") from exc
         try:
             async with conn.transaction():
-                for statement in SCHEMA:
+                for statement in self._schema:
                     await conn.execute(statement)
         except asyncpg.InsufficientPrivilegeError as exc:
             raise HistoryConfigError(f"DB_USER may not create tables in database {name!r}.") from exc
@@ -297,8 +380,8 @@ class AgentHistoryStore:
         try:
             pool = await self._require_pool()
             async with pool.acquire() as conn, conn.transaction():
-                await conn.execute(_PRUNE_EMPTY, owner, agent)
-                row = await conn.fetchrow(_UPSERT_SESSION, sid, agent, owner, None)
+                await conn.execute(self._prune_empty, owner, agent)
+                row = await conn.fetchrow(self._upsert_session, sid, agent, owner, None)
             return row["created_at"] if row else None
         except HistoryUnavailable:
             return None
@@ -326,12 +409,12 @@ class AgentHistoryStore:
             pool = await self._require_pool()
             async with pool.acquire() as conn, conn.transaction():
                 if role == "user":
-                    found = await conn.fetchrow(_UPSERT_SESSION, sid, agent, owner, title_from(content))
+                    found = await conn.fetchrow(self._upsert_session, sid, agent, owner, title_from(content))
                 else:
-                    found = await conn.fetchrow(_TOUCH_SESSION, sid, owner, agent)
+                    found = await conn.fetchrow(self._touch_session, sid, owner, agent)
                 if found is None:
                     return False
-                await conn.execute(_INSERT_MESSAGE, sid, role, content, result, is_error)
+                await conn.execute(self._insert_message, sid, role, content, result, is_error)
             return True
         except HistoryUnavailable:
             return False
@@ -339,11 +422,50 @@ class AgentHistoryStore:
             logger.warning("[AGENT_HISTORY] session=%s %s message not recorded: %s", sid.hex, role, type(exc).__name__)
             return False
 
+    async def record_agent_run(
+        self,
+        run_id: str,
+        agent_id: str,
+        session_id: str | None,
+        owner_id: str,
+        status: str,
+        intent: str | None,
+        provider_id: str | None,
+        date_from: str | None,
+        date_to: str | None,
+        started_at: datetime,
+        finished_at: datetime,
+        duration_ms: int,
+        llm_calls: int,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        total_tokens: int | None,
+        detail: dict[str, Any],
+        error: str | None = None,
+    ) -> bool:
+        """Stores one run's audit row. Returns False (and logs why) when it could not be
+        stored; the run itself is never failed because of monitoring."""
+        try:
+            pool = await self._require_pool()
+            await pool.execute(
+                _INSERT_RUN_AUDIT,
+                run_id, agent_id, session_id, owner_id, status, intent, provider_id,
+                _date_or_none(date_from), _date_or_none(date_to), started_at, finished_at, duration_ms,
+                llm_calls, input_tokens, output_tokens, total_tokens, detail, error,
+            )
+            return True
+        except HistoryUnavailable:
+            logger.warning("[AGENT_HISTORY] run=%s audit not recorded: database unavailable", run_id)
+            return False
+        except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, asyncio.TimeoutError) as exc:
+            logger.warning("[AGENT_HISTORY] run=%s audit not recorded: %s", run_id, type(exc).__name__)
+            return False
+
     # --- Reads and deletes for the history API (raise HistoryUnavailable) ---
 
     async def list_sessions(self, owner: str, agent: str, limit: int = 100) -> list[HistorySession]:
         pool = await self._require_pool()
-        rows = await self._run(pool.fetch(_LIST_SESSIONS, owner, agent, limit))
+        rows = await self._run(pool.fetch(self._list_sessions, owner, agent, limit))
         return [
             HistorySession(
                 session_id=public_session_id(r["session_id"]),
@@ -365,8 +487,8 @@ class AgentHistoryStore:
 
         async def read() -> tuple[asyncpg.Record | None, list[asyncpg.Record]]:
             async with pool.acquire() as conn:
-                head = await conn.fetchrow(_GET_SESSION, sid, owner, agent)
-                return head, (await conn.fetch(_GET_MESSAGES, sid, limit) if head else [])
+                head = await conn.fetchrow(self._get_session, sid, owner, agent)
+                return head, (await conn.fetch(self._get_messages, sid, limit) if head else [])
 
         head, rows = await self._run(read())
         if head is None:
@@ -402,7 +524,7 @@ class AgentHistoryStore:
 
         async def delete() -> list[asyncpg.Record]:
             async with pool.acquire() as conn, conn.transaction():
-                return await conn.fetch(_DELETE_SESSIONS, owner, agent, ids)
+                return await conn.fetch(self._delete_sessions, owner, agent, ids)
 
         rows = await self._run(delete())
         return [public_session_id(r["session_id"]) for r in rows]
@@ -417,3 +539,5 @@ class AgentHistoryStore:
 
 
 history_store = AgentHistoryStore()
+# The Frontend Order Enquiry Agent keeps its conversations in its own tables.
+frontorder_history_store = AgentHistoryStore("frontorder_enquiry_sessions", "frontorder_enquiry_messages")

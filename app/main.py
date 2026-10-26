@@ -6,9 +6,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes.contact_us import router as contact_us_router
 from app.api.routes.frontorder_enquiry import router as frontorder_enquiry_router
 from app.api.routes.contact_us_history import router as contact_us_history_router
+from app.api.routes.scheduling import router as scheduling_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging
-from app.history import history_store
+from app.history import frontorder_history_store, history_store
 from app.route.agents import router as agents_router
 
 configure_logging()
@@ -18,9 +19,11 @@ configure_logging()
 async def lifespan(_: FastAPI):
     # Agent chat history (AGENT_DB_NAME): created/migrated once at startup. The API
     # still starts when it can't be reached; history then retries on later use.
-    await history_store.start()
+    await history_store.start()  # Contact agents' tables
+    await frontorder_history_store.start()  # Frontend Order Enquiry Agent's tables
     yield
     await history_store.close()
+    await frontorder_history_store.close()
 
 
 app = FastAPI(title="Multi-Agent Platform", lifespan=lifespan)
@@ -39,6 +42,7 @@ app.include_router(agents_router, prefix="/api/v1")
 app.include_router(contact_us_router, prefix="/api/v1")
 app.include_router(frontorder_enquiry_router, prefix="/api/v1")
 app.include_router(contact_us_history_router, prefix="/api/v1")
+app.include_router(scheduling_router, prefix="/api/v1")
 
 
 @app.get("/health")

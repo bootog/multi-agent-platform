@@ -128,11 +128,14 @@ class BootogClient:
             transport=transport,
         )
 
-    async def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    async def get(self, path: str, params: dict[str, Any] | None = None, stats: dict[str, Any] | None = None) -> Any:
+        """`stats`, when given, is filled with {"attempts", "status_code"} for monitoring."""
         retries = max(0, self._settings.bootog_get_retries)
         for attempt in range(retries + 1):
+            if stats is not None:
+                stats["attempts"] = attempt + 1
             try:
-                return await self._request("GET", path, params=params)
+                return await self._request("GET", path, params=params, stats=stats)
             except BootogApiError as exc:
                 retryable = exc.timed_out or exc.status_code is None or exc.status_code in _RETRYABLE_STATUS
                 if attempt >= retries or not retryable:
@@ -181,6 +184,7 @@ class BootogClient:
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         clean_params = {k: v for k, v in (kwargs.pop("params", None) or {}).items() if v not in (None, "")}
+        stats = kwargs.pop("stats", None)
         try:
             response = await self._http.request(method, path.lstrip("/"), params=clean_params or None, **kwargs)
         except httpx.TimeoutException as exc:
@@ -190,6 +194,8 @@ class BootogClient:
             logger.warning("bootog %s %s transport error: %s", method, path, type(exc).__name__)
             raise BootogApiError("The Bootog service could not be reached.") from exc
 
+        if stats is not None:
+            stats["status_code"] = response.status_code
         if response.is_error:
             reason, code = _error_reason(response)
             # Endpoint, status, Bootog's code and its (short) error text only — never

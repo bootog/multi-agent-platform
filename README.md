@@ -28,6 +28,17 @@ py -m venv .venv
 | `BOOTOG_MAX_PAGES` | `10` | Page cap for lookups that page through a list (request search, providers, sub-categories). Hitting it is reported, never hidden |
 | `BOOTOG_CLIENT_TYPE` | – | Not needed: writes pass the gateway's anti-forgery check with the caller's own token (see below). Only `Mobile` is accepted (it makes the gateway skip that check) and only if the Bootog team authorises it; any other value, notably `FrontEnd` (skips session validation), is ignored with a warning |
 | `ALLOWED_ORIGINS` | `http://localhost:4201` | CORS origins (comma-separated) |
+| `SCHEDULING_PAGE_SIZE` | `10` | Scheduling Agent: smallest `pageSize` reported with a chat order list (the larger of this and the number of orders shown). It does not limit how many orders are read: a list reads every match |
+| `SCHEDULING_SLOT_DAYS` | `5` | Scheduling Agent: days of appointment slots shown when the user doesn't say how many; capped by `SCHEDULING_MAX_SLOT_DAYS`, `0` or negative → `1` |
+| `SCHEDULING_MAX_SLOT_DAYS` | `14` | Scheduling Agent: most days of appointment slots one request may show (the default window is `SCHEDULING_SLOT_DAYS`) |
+| `SCHEDULING_SLOTS_PER_DAY` | `8` | Scheduling Agent: open appointment slots listed per day |
+| `SCHEDULING_PRODUCER_RADIUS_MILES` | `30` | Scheduling Agent: producer search distance (miles) when the user gives none; also the first radius of the multi-order "nearest eligible" search. Clamped to `1`–`500` |
+| `SCHEDULING_RADIUS_STEP_MILES` | `30` | Scheduling Agent: multi-order "nearest eligible" only, when the user stated no distance: while nothing eligible is found the radius grows by this step. `0` or negative → no expansion (one search) |
+| `SCHEDULING_MAX_RADIUS_MILES` | `120` | Scheduling Agent: largest radius of that expanding search (always tried last). At or below `SCHEDULING_PRODUCER_RADIUS_MILES` → no expansion. Not clamped to 500 |
+| `SCHEDULING_MAX_BATCH_ORDERS` | `50` | Scheduling Agent: most orders one multi-order assignment may cover; a larger selection is refused. Not clamped: `0` or negative refuses every multi-order assignment |
+| `SCHEDULING_ORDER_FETCH_PAGE_SIZE` | `50` | Scheduling Agent: orders read per `GetOrderDetails` call when a chat list reads every matching order (pages are still capped by `BOOTOG_MAX_PAGES`) |
+| `SCHEDULING_UNDERSTAND_HISTORY_MESSAGES` | `12` | Scheduling Agent: latest chat messages sent to the LLM to understand a message |
+| `SCHEDULING_REPLY_HISTORY_MESSAGES` | `8` | Scheduling Agent: latest chat messages sent to the LLM to write the reply |
 | `OPENAI_API_KEY` | – | Required for the chat agent. Never logged or sent to the browser |
 | `OPENAI_CHAT_MODEL` | `gpt-4.1-mini` | Model for LangGraph text reasoning (understanding, extraction, replies) |
 | `OPENAI_TEMPERATURE` | `0.2` | Empty = model default (needed for reasoning models) |
@@ -36,6 +47,49 @@ py -m venv .venv
 | `DB_HOST` / `DB_PORT` | `localhost` / `5432` | PostgreSQL server of the agent chat-history database |
 | `DB_USER` / `DB_PASSWORD` | – | PostgreSQL login (needs CREATEDB only if `AGENT_DB_NAME` doesn't exist yet) |
 | `AGENT_DB_NAME` | – | Dedicated chat-history database (e.g. `AgentDB`), created with its tables on startup if missing. Never the core app database |
+| `FRONTORDER_ENQUIRY_PAGE_SIZE` / `FRONTORDER_ENQUIRY_MAX_PAGES` | `50` / `5` | Enquiries per page of a provider's list / page cap for follow-up checks (hitting the cap is reported as incomplete) |
+| `FRONTORDER_ENQUIRY_SUMMARY_PAGE_SIZE` | `10` | Providers per page of the provider summary |
+| `FRONTORDER_ENQUIRY_PROVIDER_MATCH_LIMIT` | `10` | Most providers offered when a provider name is ambiguous |
+| `FRONTORDER_ENQUIRY_TIMEZONE` | `Asia/Kolkata` | Business timezone for "today" and calendar dates in chat requests |
+| `FRONTORDER_ENQUIRY_MAX_RANGE_DAYS` | `366` | Longest date range one request may ask for |
+
+Settings are read once at startup from the environment; `.env` is loaded for local development
+and a real environment variable always wins over it. Every `SCHEDULING_*` setting takes a whole
+number: a non-integer value (including a decimal such as `30.5`) stops startup with a
+`ValueError`. No range is checked at startup; out-of-range values are handled where they are used,
+as described in the table. For `SCHEDULING_MAX_SLOT_DAYS`, `SCHEDULING_SLOTS_PER_DAY`,
+`SCHEDULING_ORDER_FETCH_PAGE_SIZE` and the two `*_HISTORY_MESSAGES` settings, `0` or a negative
+value is treated as `1`.
+
+Interactions worth knowing before changing them:
+
+- A chat order list reads at most `SCHEDULING_ORDER_FETCH_PAGE_SIZE` × `BOOTOG_MAX_PAGES` orders
+  (500 by default). A longer list is marked truncated, and a multi-order assignment refuses a
+  truncated list. `BOOTOG_MAX_PAGES` is shared with the Contact Us agents.
+- The largest `pageSize` Bootog accepts for `GetOrderDetails` has not been verified.
+- Chat history keeps the latest 40 messages, so `*_HISTORY_MESSAGES` values above 40 have no effect.
+- Slots are on a 60-minute grid inside the producer's working hours, so a day never has more than
+  24; `SCHEDULING_SLOTS_PER_DAY` above 24 has no effect. The LLM sees at most the first 15 slots
+  overall; the result card shows every day.
+
+Settings are read once at startup from the environment; `.env` is loaded for local development
+and a real environment variable always wins over it. Every `SCHEDULING_*` setting takes a whole
+number: a non-integer value (including a decimal such as `30.5`) stops startup with a
+`ValueError`. No range is checked at startup; out-of-range values are handled where they are used,
+as described in the table. For `SCHEDULING_MAX_SLOT_DAYS`, `SCHEDULING_SLOTS_PER_DAY`,
+`SCHEDULING_ORDER_FETCH_PAGE_SIZE` and the two `*_HISTORY_MESSAGES` settings, `0` or a negative
+value is treated as `1`.
+
+Interactions worth knowing before changing them:
+
+- A chat order list reads at most `SCHEDULING_ORDER_FETCH_PAGE_SIZE` × `BOOTOG_MAX_PAGES` orders
+  (500 by default). A longer list is marked truncated, and a multi-order assignment refuses a
+  truncated list. `BOOTOG_MAX_PAGES` is shared with the Contact Us agents.
+- The largest `pageSize` Bootog accepts for `GetOrderDetails` has not been verified.
+- Chat history keeps the latest 40 messages, so `*_HISTORY_MESSAGES` values above 40 have no effect.
+- Slots are on a 60-minute grid inside the producer's working hours, so a day never has more than
+  24; `SCHEDULING_SLOTS_PER_DAY` above 24 has no effect. The LLM sees at most the first 15 slots
+  overall; the result card shows every day.
 
 ### Chat history (`app/history/store.py`)
 
@@ -216,3 +270,36 @@ The run workflow cannot ask for missing details or a confirmation, so its
 `create_customer` step ends the run as **blocked** after mapping the customer details,
 and sends nothing. Customers, B2B clients and partners are created in the chat agent
 (see Conversions above).
+
+## Frontend Order Enquiry Agent
+
+Package: `app/agents/frontorder_enquiry/` (self-contained; reuse guide in its `README.md`).
+
+`POST /api/v1/agents/frontorder-enquiry/runs` with an optional body
+`{"message": "How many enquiries came in today?", "sessionId": "<from the previous reply>", "targetProviderId": "<guid>", "page": 2}`
+→ `{runId, steps, sessionId, sessionRestarted}` (202). Requires the caller's `Authorization: Bearer`
+token (401 without one). Follow the run on `GET /api/v1/agents/runs/{runId}/events`.
+
+Provider first:
+- **No provider selected** → provider summary: one `GET OrderEnquery/GetAllOrderEnquery` call returns
+  providers ranked by their number of matching enquiries (server-side counts, paged by provider).
+- **Provider named** ("Show me Inspection Depot Inc.") → the name is looked up in Bootog's provider list
+  (`GET Provider/GetProviders`); ambiguous names get a question, unknown names get no enquiry request. Then
+  `GET OrderEnquery?targetProviderId=<id>` returns that provider's enquiries, one page at a time, with the
+  exact total.
+- **Follow-up messages** with the same `sessionId` keep the provider, dates and kind of enquiries
+  ("now show me only converted enquiries") unless the message changes them.
+- `orderAction == 6` (converted to order) is included only for converted-enquiry requests; open-enquiry and
+  follow-up requests exclude it. "Send follow-up emails" is reported as **blocked** (no email service).
+
+```
+initialize_run → understand_request → resolve_scope ─┬→ summarize_providers ──────────────────┐
+                                                      └→ fetch_enquiries → validate_enquiries  │
+                                                         → select_enquiries → [check_follow_up]│
+                                                         → prepare_enquiries ─────────→ respond
+```
+
+Every run is audited in `agent_run_audit` (AGENT_DB_NAME): steps, API calls, LLM token usage, outcomes.
+
+Full architecture, data-flow diagram, API contracts, known API limitations and the frontend contract:
+[docs/frontend-order-inquiry-architecture.md](docs/frontend-order-inquiry-architecture.md).
