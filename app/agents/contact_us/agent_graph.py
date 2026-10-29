@@ -362,7 +362,7 @@ def build_contact_us_chat_graph(checkpointer=None):
     Args:
         checkpointer: Saves each session's state between turns (None: no saving).
     """
-    graph =StateGraph(ContactUsChatState)
+    graph = StateGraph(ContactUsChatState)
     graph.add_node("start_turn", agent_nodes.start_turn)
     for name, fn in NODES.items():
         graph.add_node(name, _recorded(name, fn))

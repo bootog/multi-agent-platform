@@ -139,7 +139,7 @@ def conversion_draft(state: ContactUsChatState) -> dict[str, Any] | None:
 
     Returns None when there is no request (and no standalone partner) to start from.
     """
-    record =conversion_record(state)
+    record = conversion_record(state)
     if record is None:
         return None
     return build_draft(draft_type(state), record, state.get("user_customer_fields") or {})
@@ -159,7 +159,7 @@ def conversion_fingerprint(state: ContactUsChatState) -> str:
     A confirmation counts only while this digest is unchanged, so editing any detail,
     the provider, the categories or an image requires confirming again.
     """
-    conv =conversion_of(state)
+    conv = conversion_of(state)
     parts: list[Any] = [
         conv.get("type"),
         conv.get("request_id"),
@@ -196,7 +196,7 @@ def _failure(conv: dict[str, Any], step: str, message: str, **extra: Any) -> dic
 
 def _completed(conv: dict[str, Any], step: str, **changes: Any) -> dict[str, Any]:
     """The conversion with `step` marked completed (once), `changes` applied and no failure."""
-    done =[s for s in conv.get("completed") or [] if s != step] + [step]
+    done = [s for s in conv.get("completed") or [] if s != step] + [step]
     return {**conv, **changes, "completed": done, "failed": None}
 
 
@@ -216,7 +216,7 @@ async def start_conversion(state: ContactUsChatState, config: RunnableConfig) ->
     - switches type when asked (see `_switched`);
     - keeps provider / category names given too early, and the "review first" choice.
     """
-    record =state.get("contact_request")
+    record = state.get("contact_request")
     request_id = record.get("id") if record else None
     conv = conversion_of(state)
     turn = state.get("turn_conversion") or {}
@@ -395,7 +395,7 @@ async def resolve_target_provider(state: ContactUsChatState, config: RunnableCon
     (one match is used, several are offered). Without a choice, the user is asked.
     A different provider clears the contractor sub-categories chosen for the previous one.
     """
-    conv =conversion_of(state)
+    conv = conversion_of(state)
     turn = state.get("turn_conversion") or {}
     candidates = conv.get("provider_candidates") or []
     pos = turn.get("option_position") if _answered(state, "choose_provider") else None
@@ -460,7 +460,7 @@ async def resolve_target_provider(state: ContactUsChatState, config: RunnableCon
 @tracked_step("search_providers", "Searching service providers", "Unable to search service providers.")
 async def search_providers(state: ContactUsChatState, config: RunnableConfig) -> StepResult:
     """"List / find service providers": search by name and/or location; up to 25 are kept."""
-    query =state.get("provider_query") or {}
+    query = state.get("provider_query") or {}
     providers, truncated = await find_providers(config, query.get("name"), query.get("location"))
     results = {
         "query": query,
@@ -569,7 +569,7 @@ async def check_existing_account(state: ContactUsChatState, config: RunnableConf
     Raises:
         StepFailed: BOOTOG could not be asked. Not knowing is never "no account".
     """
-    conv =conversion_of(state)
+    conv = conversion_of(state)
     ctype = active_type(state)
     email = (state.get("customer_payload") or {}).get("email") or ""
     failed = conv.get("failed") or {}
@@ -663,7 +663,7 @@ async def resolve_role(state: ContactUsChatState, config: RunnableConfig) -> Ste
     Raises:
         StepFailed: The role could not be verified; nothing can be created without it.
     """
-    conv =conversion_of(state)
+    conv = conversion_of(state)
     ctype = active_type(state)
     try:
         role_id = await get_default_role_id.ainvoke({"role_name": ctype.role_name}, config=config)
@@ -684,7 +684,7 @@ async def select_subcategories(state: ContactUsChatState, config: RunnableConfig
     that match exactly. Partial matches are offered as numbered options; the turn then
     waits for the user's choice.
     """
-    conv =conversion_of(state)
+    conv = conversion_of(state)
     turn = state.get("turn_conversion") or {}
     provider_id = (conv.get("target_provider") or {}).get("id")
     page = await get_contractor_subcategories.ainvoke({"target_provider_id": provider_id}, config=config)
@@ -784,7 +784,7 @@ async def confirm_conversion(state: ContactUsChatState, config: RunnableConfig) 
     The fingerprint of the details shown is stored; only a confirmation of exactly
     those details allows creation.
     """
-    conv =conversion_of(state)
+    conv = conversion_of(state)
     conv["awaiting_fingerprint"] = conversion_fingerprint(state)
     await _emitter(config).step("confirm_conversion", "waiting", f"Waiting for confirmation: {active_type(state).label}")
     return _waiting({"conversion": conv, "current_step": "confirm_conversion"}, {"type": "confirm_conversion"})
@@ -807,7 +807,7 @@ async def create_account(state: ContactUsChatState, config: RunnableConfig) -> S
         StepFailed: The account was not created, or was most likely created with an error.
         StepBlocked: The email turned out to already have the role.
     """
-    conv =conversion_of(state)
+    conv = conversion_of(state)
     ctype = active_type(state)
     if "create_account" in (conv.get("completed") or []):
         return StepResult("Account already created", {"conversion": conv})
@@ -933,7 +933,7 @@ async def verify_account(state: ContactUsChatState, config: RunnableConfig) -> S
     Raises:
         StepFailed: The role is missing, or (for company types) no company id came back.
     """
-    conv =conversion_of(state)
+    conv = conversion_of(state)
     ctype = active_type(state)
     email = (conv.get("account") or {}).get("email") or (state.get("customer_payload") or {}).get("email")
     accounts = await lookup_accounts(config, email)  # same case handling as the pre-check
@@ -960,7 +960,7 @@ async def link_provider_vendor(state: ContactUsChatState, config: RunnableConfig
     Raises:
         StepFailed: BOOTOG refused the link; a retry resumes at this step.
     """
-    conv =conversion_of(state)
+    conv = conversion_of(state)
     provider = conv.get("target_provider") or {}
     try:
         await link_vendor_to_provider.ainvoke(
@@ -979,7 +979,7 @@ async def save_subcategories(state: ContactUsChatState, config: RunnableConfig) 
     Raises:
         StepFailed: BOOTOG refused; a retry resumes at this step.
     """
-    conv =conversion_of(state)
+    conv = conversion_of(state)
     provider = conv.get("target_provider") or {}
     try:
         await save_contractor_subcategories.ainvoke(
@@ -1000,7 +1000,7 @@ async def update_request_status(state: ContactUsChatState, config: RunnableConfi
         StepFailed: There is no request, the update failed, or the status could not be
             verified.
     """
-    conv =conversion_of(state)
+    conv = conversion_of(state)
     if not conv.get("request_id"):  # not a step of a standalone partner; never sent without a request
         raise StepFailed("There is no Contact Us request to update.", {"conversion": conv})
     try:

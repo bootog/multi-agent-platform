@@ -47,7 +47,7 @@ def status_value(name: str | None) -> int | None:
 
     Case, spaces and punctuation are ignored. Returns None when the name is not a status.
     """
-    key =re.sub(r"[^a-z]", "", (name or "").casefold())
+    key = re.sub(r"[^a-z]", "", (name or "").casefold())
     if not key:
         return None
     for value, label in CONTACT_US_STATUS_LABELS.items():
@@ -89,7 +89,7 @@ def _history_target(state: ContactUsChatState) -> dict[str, Any] | None:
 
 def _entry(row: dict[str, Any]) -> dict[str, Any]:
     """One tracking-history row as the history card shows it (HTML comments as plain text)."""
-    status =row.get("contactUsStatus")
+    status = row.get("contactUsStatus")
     return {
         "id": row.get("id"),
         "statusId": status if isinstance(status, int) else None,
@@ -121,7 +121,7 @@ async def get_tracking_history(state: ContactUsChatState, config: RunnableConfig
     Raises:
         StepFailed: No request is selected.
     """
-    target =_history_target(state)
+    target = _history_target(state)
     if not target:
         raise StepFailed("No request is selected to show the history of.")
     view: dict[str, Any] = {"requestId": target["id"], "name": target.get("name"), "entries": [], "total": 0}
@@ -168,7 +168,7 @@ async def prepare_status_change(state: ContactUsChatState, config: RunnableConfi
     Raises:
         StepFailed: No request is selected.
     """
-    ask =state.get("status_request") or {}
+    ask = state.get("status_request") or {}
     records = _targets(state)
     if not records:
         raise StepFailed("No request is selected to change the status of.")
@@ -214,7 +214,7 @@ async def change_request_status(state: ContactUsChatState, config: RunnableConfi
     Raises:
         StepFailed: This turn did not confirm a pending change.
     """
-    change =dict(state.get("status_change") or {})
+    change = dict(state.get("status_change") or {})
     # Enforced here, not by the prompt: exactly the change that was shown, confirmed now, once.
     if not (state.get("status_change_confirmed") and change.get("state") == "confirming"
             and (change.get("status") or {}).get("id") in SETTABLE_STATUSES and change.get("ids")):
@@ -296,7 +296,7 @@ def status_change_facts(state: ContactUsChatState) -> dict[str, Any] | None:
 
     Returns None when this turn has no status change.
     """
-    view =status_change_view(state)
+    view = status_change_view(state)
     if not view:
         return None
     names = {r["id"]: r["name"] for r in view["requests"]}

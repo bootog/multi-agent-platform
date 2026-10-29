@@ -192,7 +192,7 @@ async def understand(
     Returns:
         The typed interpretation of the message.
     """
-    structured =_llm(config).with_structured_output(TurnUnderstanding)
+    structured = _llm(config).with_structured_output(TurnUnderstanding)
     messages: list[BaseMessage] = [
         SystemMessage(UNDERSTAND_SYSTEM_PROMPT),
         SystemMessage(f"Current agent state (today is {date.today().isoformat()}):\n{_json(state_summary)}"),

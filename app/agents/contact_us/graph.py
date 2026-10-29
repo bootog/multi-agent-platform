@@ -64,7 +64,7 @@ def _after_retrieval(state: ContactUsAgentState) -> str:
 
 def build_contact_us_graph():
     """Build and compile the run workflow graph shown in the module docstring."""
-    graph =StateGraph(ContactUsAgentState)
+    graph = StateGraph(ContactUsAgentState)
     graph.add_node("initialize_run", nodes.initialize_run)
     graph.add_node("select_provider", nodes.select_provider)
     graph.add_node("get_contact_us_data", nodes.get_contact_us_data)
@@ -98,7 +98,7 @@ def _final_message(state: ContactUsAgentState, status: str) -> str:
 
 def _result(state: ContactUsAgentState) -> dict[str, Any]:
     """The `result` payload of the run's final event (camelCase keys for the UI)."""
-    selected =state.get("contact_request")
+    selected = state.get("contact_request")
     return {
         "mode": state.get("mode"),
         "providerId": state.get("provider_id"),

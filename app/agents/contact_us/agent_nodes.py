@@ -198,7 +198,7 @@ def _name_matches(reference: str, record: dict[str, Any]) -> bool:
 
 def _exact_name(reference: str, record: dict[str, Any]) -> bool:
     """True when the reference is exactly the record's full name (ignoring case and punctuation)."""
-    name =f"{record.get('firstName') or ''} {record.get('lastName') or ''}"
+    name = f"{record.get('firstName') or ''} {record.get('lastName') or ''}"
     return " ".join(re.findall(r"[^\W_]+", name.casefold())) == " ".join(re.findall(r"[^\W_]+", reference.casefold()))
 
 
@@ -417,7 +417,7 @@ def customer_draft(state: ContactUsChatState) -> dict[str, Any] | None:
 
 def listed_records(state: ContactUsChatState) -> list[dict[str, Any]]:
     """The retrieved requests to list; only incomplete ones when the user asked for those."""
-    records =state.get("contact_requests") or []
+    records = state.get("contact_requests") or []
     if (state.get("request_filters") or {}).get("incomplete_only"):
         records = [r for r in records if build_customer_draft(r)[1]]
     return records
@@ -465,7 +465,7 @@ def _state_summary(state: ContactUsChatState) -> dict[str, Any]:
 
 def _options_offered(state: ContactUsChatState) -> list[str] | None:
     """The numbered options of the pending question, so the LLM can read "number 2"; else None."""
-    question =(state.get("pending_question") or {}).get("type")
+    question = (state.get("pending_question") or {}).get("type")
     conv = conversion_of(state)
     if question == "choose_partner_type":
         return [t.label for t in PARTNER_TYPES]
@@ -480,7 +480,7 @@ def _options_offered(state: ContactUsChatState) -> list[str] | None:
 
 def _agent(state: ContactUsChatState) -> dict[str, str]:
     """This Contact agent's name and what it handles, e.g. "Request Demo requests"."""
-    name =state.get("agent_name") or "Contact Us Agent"
+    name = state.get("agent_name") or "Contact Us Agent"
     return {"name": name, "handles": f"{name.removesuffix(' Agent')} requests"}
 
 
@@ -1137,7 +1137,7 @@ def _operation_for(intent: str, goal: str, current: str | None) -> str | None:
 
     A conversion of unnamed kind ("convert_request") keeps the conversion already in progress.
     """
-    operation =intent if intent in CONVERSION_OPERATIONS else goal if goal in CONVERSION_OPERATIONS else None
+    operation = intent if intent in CONVERSION_OPERATIONS else goal if goal in CONVERSION_OPERATIONS else None
     if operation == "convert_request" and current in CONVERSION_OPERATIONS:
         return current  # "proceed" continues the conversion already chosen; it never guesses one
     return operation
@@ -1256,7 +1256,7 @@ async def match_request(state: ContactUsChatState, config: RunnableConfig) -> St
     - "search": a name / email is not in the loaded requests; all requests are searched.
     - "need_reference" / "not_found": the user is asked which request they mean.
     """
-    ref =state.get("request_reference") or {}
+    ref = state.get("request_reference") or {}
     records = state.get("contact_requests") or []
     current = state.get("contact_request")
     identifying = any(ref.get(k) for k in REFERENCE_KEYS)
@@ -1465,7 +1465,7 @@ async def validate_customer_data(state: ContactUsChatState, config: RunnableConf
     Raises:
         StepFailed: No request is selected.
     """
-    draft =customer_draft(state)
+    draft = customer_draft(state)
     if draft is None:
         raise StepFailed("No Contact Us request is selected.")
     ctype = draft_type(state)
@@ -1487,7 +1487,7 @@ async def validate_customer_data(state: ContactUsChatState, config: RunnableConf
 
 async def ask_for_missing(state: ContactUsChatState, config: RunnableConfig) -> dict[str, Any]:
     """Ask for the missing and invalid fields; the turn ends waiting for the user."""
-    fields =(state.get("missing_required_fields") or []) + list(state.get("invalid_fields") or {})
+    fields = (state.get("missing_required_fields") or []) + list(state.get("invalid_fields") or {})
     await _emitter(config).step("ask_for_missing", "waiting", f"Waiting for: {', '.join(fields)}")
     return {
         "pending_question": {"type": "missing_fields", "fields": fields},
@@ -1502,7 +1502,7 @@ async def respond(state: ContactUsChatState, config: RunnableConfig) -> dict[str
     The reply LLM sees only structured facts (`build_facts`). When it fails or returns
     nothing, a plain fallback reply is used. The reply is added to the conversation history.
     """
-    emitter =_emitter(config)
+    emitter = _emitter(config)
     final = finalize_turn(state)
     merged: ContactUsChatState = {**state, **final}  # type: ignore[typeddict-item]
     facts = build_facts(merged)
@@ -1543,7 +1543,7 @@ def listed_this_turn(state: ContactUsChatState) -> bool:
 
 def conversion_finished(state: ContactUsChatState) -> bool:
     """True when every step of the conversion completed."""
-    ctype =active_type(state)
+    ctype = active_type(state)
     conv = conversion_of(state)
     return bool(ctype) and set(conversion_steps(ctype, conv)) <= set(conv.get("completed") or [])
 
@@ -1618,7 +1618,7 @@ COMPANY_TYPE_LABEL = "Vendor Company Type"
 
 def provider_missing(state: ContactUsChatState) -> bool:
     """True when the conversion type needs a service provider and none is chosen yet."""
-    ctype =active_type(state)
+    ctype = active_type(state)
     return bool(ctype and ctype.needs_target_provider and not conversion_of(state).get("target_provider"))
 
 
@@ -1822,7 +1822,7 @@ def _conversion_facts(state: ContactUsChatState) -> dict[str, Any] | None:
     Returns None when the conversion does not belong to the selected request (and is not
     a standalone partner).
     """
-    conv =conversion_of(state)
+    conv = conversion_of(state)
     unlinked = standalone(state)
     if not unlinked and (
         not conv.get("request_id") or conv.get("request_id") != (state.get("contact_request") or {}).get("id")
@@ -1982,7 +1982,7 @@ NEXT_ACTIONS = ("convert_another",)
 
 def _follow_up(state: ContactUsChatState) -> str:
     """The question offered after a finished conversion."""
-    noun =(state.get("agent_name") or "Contact Us Agent").removesuffix(" Agent")
+    noun = (state.get("agent_name") or "Contact Us Agent").removesuffix(" Agent")
     return f"Would you like to convert another {noun} request?"
 
 
