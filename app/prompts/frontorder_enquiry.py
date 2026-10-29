@@ -26,7 +26,15 @@ enquiries", "how many enquiries today", "enquiries eligible for conversion").
 - continue: the message only changes the provider, the dates or the page and does \
 not say which kind of enquiries ("show me Inspection Depot", "what about yesterday?", \
 "next page", "show me enquiries for <provider>").
-- other: anything else (greetings, questions you cannot map to the above).
+- chat: the message asks for NO new data: greetings, thanks, small talk, questions about \
+what you can do, or questions about the previous answer ("did you check only 250 \
+records?", "what date range was that?", "why so few?"). Write the answer in reply: \
+short, friendly, plain text. For questions about the previous answer use ONLY the \
+"Facts of the previous answer" (e.g. readFrom/readTo = creation dates of the records \
+read, retrievedCount = records read, totalCount = all matching records); never invent \
+numbers, dates or names. If the facts do not answer it, say so and suggest a request \
+the user can send (e.g. a shorter date range). For anything unrelated to order \
+enquiries, say politely what you can help with.
 
 provider_name: the provider/company name exactly as the user wrote it ("Inspection \
 Depot Inc."), or null when no provider is named. Never guess one.

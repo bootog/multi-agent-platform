@@ -16,21 +16,25 @@ from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
-from app.agents.frontorder_enquiry.config import get_frontorder_enquiry_settings
-from app.agents.frontorder_enquiry.dates import DateRange, DateRangeError, resolve_period, today_in
-from app.agents.frontorder_enquiry.monitoring import RunMonitor
-from app.agents.frontorder_enquiry.responses import build_reply, build_result
-from app.agents.frontorder_enquiry.schemas import (
+from app.agents.frontorder_enquiry.domain import (
     FOLLOW_UP_ACTIONS,
+    DateRange,
+    DateRangeError,
+    answer_facts,
     build_enquiry_context,
+    build_reply,
+    build_result,
     classify_enquiries,
     enquiry_id,
     filter_enquiries_for_intent,
     is_contact_log,
     latest_contact,
+    resolve_period,
+    today_in,
     validate_enquiries,
     wants_converted,
 )
+from app.agents.frontorder_enquiry.monitoring import RunMonitor
 from app.agents.frontorder_enquiry.state import EnquiryScope, FrontOrderEnquiryAgentState
 from app.agents.frontorder_enquiry.tools import (
     get_enquiry_contact_history,
@@ -41,6 +45,7 @@ from app.agents.frontorder_enquiry.tools import (
 )
 from app.agents.frontorder_enquiry.understanding import DEFAULT_REQUEST, understand_request
 from app.agents.runtime import RunEmitter, utc_now
+from app.core.config import get_settings
 from app.core.logging import get_logger, log_step
 from app.integrations.bootog import BootogApiError
 from app.llm import LlmNotConfiguredError
@@ -145,7 +150,7 @@ def _utc_window(scope: EnquiryScope) -> dict[str, str]:
     if not (scope.get("date_from") and scope.get("date_to")):
         return {}
     date_range = DateRange(date.fromisoformat(scope["date_from"]), date.fromisoformat(scope["date_to"]))
-    start, end = date_range.utc_bounds(get_frontorder_enquiry_settings().timezone)
+    start, end = date_range.utc_bounds(get_settings().frontorder_enquiry_timezone)
     return {"created_from": start.isoformat(), "created_before": end.isoformat()}
 
 
@@ -161,20 +166,25 @@ async def initialize_run(state: FrontOrderEnquiryAgentState, config: RunnableCon
 @tracked_step("understand_request", "Understanding the request", "Unable to understand the request.")
 async def understand_request_node(state: FrontOrderEnquiryAgentState, config: RunnableConfig) -> StepResult:
     """Interpret THIS message: action, dates, provider name, page. The LLM classifies the
-    message; the dates themselves are computed and validated in dates.py. Merging with
+    message; the dates themselves are computed and validated in domain.py. Merging with
     the conversation's earlier scope happens in resolve_scope."""
-    settings = get_frontorder_enquiry_settings()
-    today = today_in(settings.timezone)
+    settings = get_settings()
+    today = today_in(settings.frontorder_enquiry_timezone)
     message = (state.get("message") or "").strip()
+    reused = False  # True when a saved interpretation was used instead of calling the model
     if not message:
         request = DEFAULT_REQUEST
     else:
         try:
-            request, usage = await understand_request(config, message, today)
+            request, usage = await understand_request(config, message, today, state.get("last_answer"))
         except LlmNotConfiguredError as exc:
             raise StepFailed(str(exc)) from exc
+        reused = usage is None
         if _monitor(config):
-            _monitor(config).llm_call(usage)
+            if reused:
+                _monitor(config).outcome(llm_calls_saved=1)
+            else:
+                _monitor(config).llm_call(usage)
 
     logger.info(
         "[%s] run=%s action=%s period=%s provider_named=%s all_providers=%s page_change=%s",
@@ -183,8 +193,13 @@ async def understand_request_node(state: FrontOrderEnquiryAgentState, config: Ru
     )
     if request.action == "send_follow_up":
         raise StepBlocked(FOLLOW_UP_EMAIL_UNAVAILABLE)
-    if request.action == "other":
-        return _clarify(HELP_MESSAGE, action=request.action)
+    if request.action == "chat":
+        # Greeting, small talk or a question about the previous answer: the model already
+        # wrote the reply from the saved facts, so no Bootog call is needed.
+        return StepResult(
+            "Answered from the conversation (no data request)",
+            {"clarification": request.reply or HELP_MESSAGE, "view": "clarification", "action": request.action},
+        )
     if request.needs_clarification:
         return _clarify(request.clarification_question or "Which dates should I look at?", action=request.action)
 
@@ -195,7 +210,7 @@ async def understand_request_node(state: FrontOrderEnquiryAgentState, config: Ru
             date_range = resolve_period(
                 request.period,
                 today,
-                settings.max_range_days,
+                settings.frontorder_enquiry_max_range_days,
                 last_n_days=request.last_n_days,
                 start_date=request.start_date,
                 end_date=request.end_date,
@@ -220,6 +235,8 @@ async def understand_request_node(state: FrontOrderEnquiryAgentState, config: Ru
     label = "inherited dates" if dates["dates"] == "inherit" else (
         f"{dates['date_from']} to {dates['date_to']}" if dates.get("date_from") else "all dates"
     )
+    if reused:
+        label += ", saved interpretation, no model call"
     return StepResult(
         f"{request.request_summary or 'Order enquiries'} ({label})",
         {"requested": requested, "request_summary": request.request_summary, "clarification": None},
@@ -553,10 +570,18 @@ async def respond(state: FrontOrderEnquiryAgentState, config: RunnableConfig) ->
             monitor.outcome(providers_summarized=len(state.get("provider_summary") or []))
         elif state.get("view") == "provider_detail":
             monitor.outcome(enquiries_retrieved=len(state.get("raw_enquiries") or []))
+    reply, result = build_reply(state), build_result(state)
+    # Remember the facts of an answer that showed data, for chat questions about it.
+    # Questions, chat replies and failures keep the previous facts.
+    last_answer = state.get("last_answer") or {}
+    showed_data = state.get("view") in ("provider_summary", "provider_detail") and not state.get("clarification")
+    if status == "completed" and showed_data:
+        last_answer = answer_facts(reply, result)
     return {
         "execution_status": status,
-        "reply": build_reply(state),
-        "result": build_result(state),
+        "reply": reply,
+        "result": result,
+        "last_answer": last_answer,
         "raw_enquiries": [],
         "valid_enquiries": [],
         "selected_enquiries": [],

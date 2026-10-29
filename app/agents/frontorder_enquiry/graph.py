@@ -7,7 +7,7 @@ START -> initialize_run -> understand_request -> resolve_scope
                                  -> prepare_enquiries ────────────────────────────┤
                                                                      respond -> END
 
-- understand_request: chat message -> action, dates, provider NAME, page (LLM + dates.py).
+- understand_request: chat message -> action, dates, provider NAME, page (LLM + domain.py dates).
 - resolve_scope: merges that with the conversation's previous scope and turns a
   provider name into a verified provider id (Bootog's provider list). Ambiguous or
   unknown names end the run with a question; no enquiry API is called for them.
@@ -18,7 +18,7 @@ START -> initialize_run -> understand_request -> resolve_scope
 - respond: builds the reply and the result; every path ends here (clarification,
   failure and blocked included).
 
-One conversation = one checkpointed LangGraph thread (sessions.py); one chat message =
+One conversation = one checkpointed LangGraph thread (history.py); one chat message =
 one run. `scope` survives between messages; every other state key is reset per run.
 Each message and reply is also saved to the PostgreSQL chat history (history.py).
 
@@ -33,11 +33,9 @@ from typing import Any
 from langgraph.graph import END, START, StateGraph
 
 from app.agents.frontorder_enquiry import nodes
-from app.agents.frontorder_enquiry.history import save_agent_reply, save_user_message
+from app.agents.frontorder_enquiry.domain import FOLLOW_UP_ACTIONS, build_result
+from app.agents.frontorder_enquiry.history import AGENT_KEY, CHECKPOINTER, save_agent_reply, save_user_message, sessions
 from app.agents.frontorder_enquiry.monitoring import RunMonitor
-from app.agents.frontorder_enquiry.responses import build_result
-from app.agents.frontorder_enquiry.schemas import FOLLOW_UP_ACTIONS
-from app.agents.frontorder_enquiry.sessions import AGENT_KEY, CHECKPOINTER, sessions
 from app.agents.frontorder_enquiry.state import FrontOrderEnquiryAgentState
 from app.agents.runtime import RunChannel, RunEmitter, utc_now
 from app.core.logging import get_logger

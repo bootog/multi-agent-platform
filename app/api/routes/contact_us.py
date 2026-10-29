@@ -10,17 +10,15 @@ from app.agents.contact_us.history import canonical_session_id, record_turn, res
 from app.agents.contact_us.modules import canonical_agent_key
 from app.agents.contact_us.schemas import ChatTurnRequest, ChatTurnStarted, ContactUsRunRequest, ProviderOut, RunStarted
 from app.agents.runtime import registry
-from app.integrations.bootog import BootogApiError, BootogAuth, BootogClient, ProviderApi
+from app.integrations.bootog import BootogApiError, BootogClient, ProviderApi
+from app.integrations.bootog.client import auth_from_headers
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
 
-def _auth(authorization: str | None, tenant_id: str | None, role_id: str | None, device_id: str | None) -> BootogAuth:
-    """Forward the caller's Bootog identity (same headers the Angular host sends)."""
-    token = None
-    if authorization and authorization.lower().startswith("bearer "):
-        token = authorization[7:].strip() or None
-    return BootogAuth(bearer_token=token, tenant_id=tenant_id, role_id=role_id, device_id=device_id)
+# Forward the caller's Bootog identity (shared helper; kept under this name for the
+# Contact and Scheduling routes).
+_auth = auth_from_headers
 
 
 @router.get("/contact-us/providers", response_model=list[ProviderOut], response_model_by_alias=True)

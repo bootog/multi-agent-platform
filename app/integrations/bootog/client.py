@@ -55,6 +55,17 @@ class BootogAuth:
         return headers
 
 
+def auth_from_headers(
+    authorization: str | None, tenant_id: str | None, role_id: str | None, device_id: str | None
+) -> BootogAuth:
+    """The caller's Bootog identity from the request headers the Angular host sends
+    (Authorization: Bearer ..., X-Tenant-Id, X-Role-Id, X-Device-Id)."""
+    token = None
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip() or None
+    return BootogAuth(bearer_token=token, tenant_id=tenant_id, role_id=role_id, device_id=device_id)
+
+
 class BootogApiError(Exception):
     """A Bootog call failed. `message` is safe to show to users: no URLs or tokens, only
     Bootog's own error text (which the host app already shows to users). `code` is

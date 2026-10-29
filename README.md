@@ -273,7 +273,9 @@ and sends nothing. Customers, B2B clients and partners are created in the chat a
 
 ## Frontend Order Enquiry Agent
 
-Package: `app/agents/frontorder_enquiry/` (self-contained; reuse guide in its `README.md`).
+Agent: `app/agents/frontorder_enquiry/`; Bootog calls: `app/integrations/bootog/order_enquiry.py`; prompt:
+`app/prompts/frontorder_enquiry.py`; routes: `app/api/routes/frontorder_enquiry.py` and
+`frontorder_enquiry_history.py`. Folder structure and rules: §2 of the architecture document below.
 
 `POST /api/v1/agents/frontorder-enquiry/runs` with an optional body
 `{"message": "How many enquiries came in today?", "sessionId": "<from the previous reply>", "targetProviderId": "<guid>", "page": 2}`
@@ -299,7 +301,9 @@ initialize_run → understand_request → resolve_scope ─┬→ summarize_prov
                                                          → prepare_enquiries ─────────→ respond
 ```
 
-Every run is audited in `agent_run_audit` (AGENT_DB_NAME): steps, API calls, LLM token usage, outcomes.
+Every message and reply is stored in the tables `frontorder_enquiry_sessions` / `frontorder_enquiry_messages`
+(AGENT_DB_NAME) and listed by `GET /api/v1/agents/frontorder-enquiry/history` (History panel). Every run is
+audited in `agent_run_audit`: steps, API calls, LLM token usage, outcomes.
 
 Full architecture, data-flow diagram, API contracts, known API limitations and the frontend contract:
 [docs/frontend-order-inquiry-architecture.md](docs/frontend-order-inquiry-architecture.md).

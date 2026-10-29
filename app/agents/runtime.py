@@ -1,9 +1,15 @@
 """Agent run registry + live event channel, shared by all agents.
 
 Each run gets its own channel. Nodes publish structured events while the graph
-executes; SSE subscribers replay what already happened and then follow live."""
+executes; SSE subscribers replay what already happened and then follow live.
+
+Also shared by the chat agents: ChatSessions (who owns a conversation, one message at a
+time, idle expiry) and owner_fingerprint (an opaque caller id from the bearer token)."""
 
 import asyncio
+import base64
+import hashlib
+import json
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -118,3 +124,92 @@ class RunEmitter:
 
 
 registry = RunRegistry()
+
+
+# --- chat sessions (shared by the chat agents) ---------------------------------------
+
+
+class ChatSessions:
+    """Bookkeeping beside the checkpointer: who owns a session, one turn at a time,
+    and expiry of idle sessions."""
+
+    def __init__(self, checkpointer, ttl_seconds: float = 4 * 3600, max_sessions: int = 500):
+        self._checkpointer = checkpointer
+        self._ttl = ttl_seconds
+        self._max = max_sessions
+        self._owners: dict[str, str] = {}
+        self._agents: dict[str, str] = {}
+        self._last_used: dict[str, float] = {}
+        self._busy: set[str] = set()
+
+    async def create(self, owner: str, agent: str) -> str:
+        """Register a new session for this owner and agent; returns its id."""
+        await self._prune()
+        session_id = uuid.uuid4().hex
+        self._owners[session_id] = owner
+        self._agents[session_id] = agent
+        self._last_used[session_id] = time.monotonic()
+        return session_id
+
+    async def restore(self, session_id: str, owner: str, agent: str) -> None:
+        """Re-registers a conversation reopened from chat history under its own id."""
+        await self._prune()
+        self._owners[session_id] = owner
+        self._agents[session_id] = agent
+        self._last_used[session_id] = time.monotonic()
+
+    def owner_of(self, session_id: str) -> str | None:
+        """Fingerprint of the session's owner, or None for an unknown session."""
+        return self._owners.get(session_id)
+
+    def agent_of(self, session_id: str) -> str | None:
+        """Canonical key of the Contact agent the session was started for."""
+        return self._agents.get(session_id)
+
+    def begin(self, session_id: str) -> bool:
+        """Mark a turn as running. False when the session is already running one."""
+        if session_id in self._busy:
+            return False
+        self._busy.add(session_id)
+        self._last_used[session_id] = time.monotonic()
+        return True
+
+    def end(self, session_id: str) -> None:
+        """Mark the session's turn as finished."""
+        self._busy.discard(session_id)
+        self._last_used[session_id] = time.monotonic()
+
+    async def delete(self, session_id: str) -> None:
+        """Forget the session and delete its saved graph state."""
+        self._owners.pop(session_id, None)
+        self._agents.pop(session_id, None)
+        self._last_used.pop(session_id, None)
+        await self._checkpointer.adelete_thread(session_id)
+
+    async def _prune(self) -> None:
+        """Delete idle sessions (unused longer than the TTL), then the least recently used
+        ones if needed so that one more session fits under `max_sessions`. Sessions
+        running a turn are never deleted."""
+        now = time.monotonic()
+        idle = [s for s, t in self._last_used.items() if s not in self._busy and now - t > self._ttl]
+        oldest = sorted((t, s) for s, t in self._last_used.items() if s not in self._busy and s not in idle)
+        idle += [s for _, s in oldest[: max(0, len(self._last_used) - len(idle) - self._max + 1)]]
+        for session_id in idle:
+            await self.delete(session_id)
+
+
+
+
+def owner_fingerprint(bearer_token: str | None) -> str:
+    """Opaque id of the caller; the token itself is never stored. Uses the JWT subject
+    when available so a silently refreshed token keeps the same conversation. Bootog
+    still validates the token itself on every API call."""
+    identity = bearer_token or "anonymous"
+    try:
+        payload = bearer_token.split(".")[1]  # type: ignore[union-attr]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        if isinstance(claims, dict) and isinstance(claims.get("sub"), str):
+            identity = "sub:" + claims["sub"]
+    except (AttributeError, IndexError, ValueError):
+        pass
+    return hashlib.sha256(identity.encode()).hexdigest()
