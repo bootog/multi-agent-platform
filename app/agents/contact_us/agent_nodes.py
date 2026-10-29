@@ -60,8 +60,8 @@ from app.agents.contact_us.request_actions import (
     CONTACT_US_STATUS_LABELS,
     COMMENT_LIMIT,
     SETTABLE_STATUSES,
+    full_name,
     status_change_facts,
-    status_change_view,
 )
 from app.agents.contact_us.schemas import build_customer_draft, summarize_contact_request
 from app.agents.contact_us.state import ContactUsChatState
@@ -148,6 +148,9 @@ class ChatEmitter(RunEmitter):
         data: dict[str, Any] | None = None,
         duration_ms: int | None = None,
     ) -> None:
+        """Publish a step event. A "running" event starts a new activity; the event that
+        ends it (completed, failed, waiting, ...) reuses its activityId. An event with no
+        "running" before it is an activity of its own."""
         if status == "running" or step not in self._open:
             self._seq[step] = self._seq.get(step, 0) + 1
         if status == "running":
@@ -171,17 +174,15 @@ class ChatEmitter(RunEmitter):
 
 
 def _emitter(config: RunnableConfig) -> ChatEmitter:
+    """The turn's event emitter, injected through the RunnableConfig."""
     return config["configurable"]["emitter"]
 
 
 # --- helpers -----------------------------------------------------------------
 
 
-def full_name(record: dict[str, Any] | None) -> str:
-    return " ".join(p for p in ((record or {}).get("firstName"), (record or {}).get("lastName")) if p) or "Unnamed request"
-
-
 def _tokens(text: str | None) -> list[str]:
+    """Lower-case words of the text, ignoring one-letter words."""
     return [t for t in re.findall(r"[^\W_]+", (text or "").casefold()) if len(t) > 1]
 
 
@@ -196,7 +197,8 @@ def _name_matches(reference: str, record: dict[str, Any]) -> bool:
 
 
 def _exact_name(reference: str, record: dict[str, Any]) -> bool:
-    name = f"{record.get('firstName') or ''} {record.get('lastName') or ''}"
+    """True when the reference is exactly the record's full name (ignoring case and punctuation)."""
+    name =f"{record.get('firstName') or ''} {record.get('lastName') or ''}"
     return " ".join(re.findall(r"[^\W_]+", name.casefold())) == " ".join(re.findall(r"[^\W_]+", reference.casefold()))
 
 
@@ -209,6 +211,7 @@ def _iso_date(value: str | None) -> str | None:
 
 
 def _snake(key: str) -> str:
+    """A note's key in snake_case ("Customer Type" -> "customer_type"), at most 60 characters."""
     return re.sub(r"[^a-z0-9]+", "_", key.strip().casefold()).strip("_")[:60]
 
 
@@ -305,9 +308,10 @@ def merge_list_filters(state: ContactUsChatState, f: Any) -> tuple[dict[str, Any
             elif pages and page > pages:
                 problems.append(f"page {page} (the list has {pages} page{'s' if pages != 1 else ''})")
     active["page"] = page
-    return {k: v for k, v in active.items() if v not in (None, [], False) or k == "page"}, problems, (
-        "all" in clear or "company" in clear
-    )
+    # Empty values are dropped; the page is always kept.
+    merged = {k: v for k, v in active.items() if v not in (None, [], False) or k == "page"}
+    company_removed = "all" in clear or "company" in clear
+    return merged, problems, company_removed
 
 
 def query_filters(active: dict[str, Any]) -> dict[str, Any]:
@@ -361,11 +365,17 @@ def request_filters_view(state: ContactUsChatState) -> dict[str, Any]:
 
 
 def _describe_filters(state: ContactUsChatState, view: dict[str, Any]) -> dict[str, Any]:
+    """The filter card's filters (`view`, from request_filters_view) in words for the LLM."""
     names = {o["id"]: o["name"] for o in view["statusOptions"]}
+    chosen_statuses = [names[s] for s in view["statuses"] if s in names]
+    scope_text = {
+        "all": "every status",
+        "open": "open requests only (Completed, CRM Completed and Closed excluded)",
+    }
+    # "selected" with none of its statuses known is described with the "open" wording.
+    scope = view["statusScope"] if view["statusScope"] != "selected" else "open"
     return {
-        "status": [names[s] for s in view["statuses"] if s in names] or {
-            "all": "every status", "open": "open requests only (Completed, CRM Completed and Closed excluded)",
-        }[view["statusScope"] if view["statusScope"] != "selected" else "open"],
+        "status": chosen_statuses or scope_text[scope],
         "company": (view["provider"] or {}).get("name") or "all companies",
         "created": {"from": view["createdFrom"], "to": view["createdTo"]} if view["createdFrom"] or view["createdTo"] else "any date",
         "assigned_to": view["assignee"],
@@ -389,6 +399,8 @@ def status_values(names: list[str]) -> list[int]:
 
 
 def request_summary(record: dict[str, Any]) -> dict[str, Any]:
+    """A request as the chat's request cards show it: the picker summary plus its status
+    label and the customer fields it lacks."""
     _, missing = build_customer_draft(record)
     status = record.get("status")
     return {
@@ -404,7 +416,8 @@ def customer_draft(state: ContactUsChatState) -> dict[str, Any] | None:
 
 
 def listed_records(state: ContactUsChatState) -> list[dict[str, Any]]:
-    records = state.get("contact_requests") or []
+    """The retrieved requests to list; only incomplete ones when the user asked for those."""
+    records =state.get("contact_requests") or []
     if (state.get("request_filters") or {}).get("incomplete_only"):
         records = [r for r in records if build_customer_draft(r)[1]]
     return records
@@ -451,7 +464,8 @@ def _state_summary(state: ContactUsChatState) -> dict[str, Any]:
 
 
 def _options_offered(state: ContactUsChatState) -> list[str] | None:
-    question = (state.get("pending_question") or {}).get("type")
+    """The numbered options of the pending question, so the LLM can read "number 2"; else None."""
+    question =(state.get("pending_question") or {}).get("type")
     conv = conversion_of(state)
     if question == "choose_partner_type":
         return [t.label for t in PARTNER_TYPES]
@@ -465,7 +479,8 @@ def _options_offered(state: ContactUsChatState) -> list[str] | None:
 
 
 def _agent(state: ContactUsChatState) -> dict[str, str]:
-    name = state.get("agent_name") or "Contact Us Agent"
+    """This Contact agent's name and what it handles, e.g. "Request Demo requests"."""
+    name =state.get("agent_name") or "Contact Us Agent"
     return {"name": name, "handles": f"{name.removesuffix(' Agent')} requests"}
 
 
@@ -520,6 +535,16 @@ async def start_turn(state: ContactUsChatState, config: RunnableConfig) -> dict[
 
 @tracked_step("understand_message", "Understanding your message", "I couldn't interpret that message.")
 async def understand_message(state: ContactUsChatState, config: RunnableConfig) -> StepResult:
+    """Turn the user's message (or submitted card form) into this turn's structured fields.
+
+    A form needs no interpretation and skips the LLM (`_understand_form`). A message is
+    interpreted by the LLM; the result is then cleaned and checked here: field values,
+    request references, list filters, status changes and the ongoing operation. Only
+    well-formed values are kept; what could not be used is reported, never guessed.
+
+    Raises:
+        StepFailed: The LLM is not configured.
+    """
     if state.get("form_submission"):
         return _understand_form(state, state["form_submission"])
     try:
@@ -527,13 +552,14 @@ async def understand_message(state: ContactUsChatState, config: RunnableConfig) 
     except LlmNotConfiguredError as exc:
         raise StepFailed("The AI service is not configured, so I can't process messages yet.") from exc
 
+    # The question the agent asked before this message (None when nothing was asked).
+    pending_type = (state.get("pending_question") or {}).get("type")
     intent = result.intent
-    if (state.get("pending_question") or {}).get("type") == "next_action" and intent == "confirm_action":
+    if pending_type == "next_action" and intent == "confirm_action":
         # "Yes" to "convert another request?" names no request: show the open ones to pick
         # from. A bare yes never starts a conversion.
         intent = "list_requests"
     company_pick = assignee_pick = None
-    pending_type = (state.get("pending_question") or {}).get("type")
     if pending_type in ("choose_company", "choose_assignee") and result.conversion is not None:
         # A number answering "which company / assignee?" picks from those offered, and lists.
         candidates = state.get("company_candidates" if pending_type == "choose_company" else "assignee_candidates") or []
@@ -569,7 +595,7 @@ async def understand_message(state: ContactUsChatState, config: RunnableConfig) 
     if operation:
         update["operation"] = operation
     elif answers_status_change:
-        pass
+        pass  # the operation stays as it is; _understand_status_change handles the answer
     elif result.intent == "cancel_operation" or result.goal == "none":
         update["operation"] = None
         current = conversion_of(state)
@@ -597,13 +623,12 @@ async def understand_message(state: ContactUsChatState, config: RunnableConfig) 
         if _snake(item.key) and item.value.strip()
     }
 
-    previous_question = (state.get("pending_question") or {}).get("type")
     if conv is not None and conv.review_first:
         update["turn_conversion"] = {**update.get("turn_conversion", {}), "review_first": True}
     if result.intent == "review_details":
         update["turn_conversion"] = {**update.get("turn_conversion", {}), "review_first": True}
     # "Create it" counts only as the answer to the ready-to-create summary the user saw.
-    update["explicit_create"] = previous_question == "ready_to_create" and result.intent in (
+    update["explicit_create"] = pending_type == "ready_to_create" and result.intent in (
         "confirm_action", "create_customer", "convert_request"
     )
     if result.intent == "edit_details" and not update.get("turn_field_updates"):
@@ -613,8 +638,7 @@ async def understand_message(state: ContactUsChatState, config: RunnableConfig) 
     filters: dict[str, Any] = {}
     ignored: list[str] = []
     reference = _reference(result.request_reference, ignored)
-    answered = (state.get("pending_question") or {}).get("type")
-    if answered in ("choose_request", "which_request") and conv is not None and conv.option_position:
+    if pending_type in ("choose_request", "which_request") and conv is not None and conv.option_position:
         # A bare number answering "which request?" picks from the request list shown,
         # however the model labelled it.
         if not reference or not any(reference.get(k) for k in REFERENCE_KEYS):
@@ -775,6 +799,7 @@ def _names_current_request(state: ContactUsChatState, ref: dict[str, Any]) -> bo
 
 
 def _apply_discriminators(records: list[dict[str, Any]], ref: dict[str, Any]) -> list[dict[str, Any]]:
+    """Narrow the records by the reference's created date, status and assignee, when given."""
     out = records
     if ref.get("created_date"):
         out = [r for r in out if str(r.get("createdDate") or "")[:10] == ref["created_date"]]
@@ -829,11 +854,12 @@ def _understand_form(state: ContactUsChatState, form: dict[str, Any]) -> StepRes
     restored = not record and not unlinked_card and bool(_REQUEST_ID.match(request_id))
     # The same for a partner card without a request: its partner form is started again.
     unlinked_lost = unlinked_card and not record and not conv.get("standalone")
-    stale = (
-        (record or conv.get("form_id") != request_id) and not unlinked_lost
-        if unlinked_card
-        else not restored and request_id != str(record.get("id"))
-    )
+    if unlinked_card:
+        # A partner card without a request: stale when a request is now selected or
+        # another partner form is open (unless that form's state was lost; see above).
+        stale = bool(record or conv.get("form_id") != request_id) and not unlinked_lost
+    else:
+        stale = not restored and request_id != str(record.get("id"))
     if stale:
         # A request IS selected (or another partner form is open) and the card belongs to
         # something else: apply nothing.
@@ -1107,7 +1133,11 @@ def _form_coordinates(values: dict[str, Any]) -> dict[str, str]:
 
 
 def _operation_for(intent: str, goal: str, current: str | None) -> str | None:
-    operation = intent if intent in CONVERSION_OPERATIONS else goal if goal in CONVERSION_OPERATIONS else None
+    """The conversion this message asks for (from its intent, else its goal), or None.
+
+    A conversion of unnamed kind ("convert_request") keeps the conversion already in progress.
+    """
+    operation =intent if intent in CONVERSION_OPERATIONS else goal if goal in CONVERSION_OPERATIONS else None
     if operation == "convert_request" and current in CONVERSION_OPERATIONS:
         return current  # "proceed" continues the conversion already chosen; it never guesses one
     return operation
@@ -1218,7 +1248,15 @@ async def resolve_provider(state: ContactUsChatState, config: RunnableConfig) ->
 
 @tracked_step("match_request", "Matching the request", "Unable to match the request.")
 async def match_request(state: ContactUsChatState, config: RunnableConfig) -> StepResult:
-    ref = state.get("request_reference") or {}
+    """Find the request the user means, without guessing.
+
+    The `match_result` status tells the router what to do next:
+    - "matched": exactly one request matches; it is selected.
+    - "ambiguous": several match; they are listed and the user is asked which one.
+    - "search": a name / email is not in the loaded requests; all requests are searched.
+    - "need_reference" / "not_found": the user is asked which request they mean.
+    """
+    ref =state.get("request_reference") or {}
     records = state.get("contact_requests") or []
     current = state.get("contact_request")
     identifying = any(ref.get(k) for k in REFERENCE_KEYS)
@@ -1288,7 +1326,10 @@ async def match_request(state: ContactUsChatState, config: RunnableConfig) -> St
 
 
 def _matched(state: ContactUsChatState, record: dict[str, Any], message: str) -> StepResult:
-    update: dict[str, Any] = {
+    """Select `record`. When it is another person than the selected one, forget the
+    details collected for the previous one, and the operation in progress too unless
+    this turn asks for a conversion."""
+    update:dict[str, Any] = {
         "contact_request_id": record.get("id"),
         "match_result": {"status": "matched", "request_id": record.get("id")},
     }
@@ -1311,6 +1352,7 @@ def _matched(state: ContactUsChatState, record: dict[str, Any], message: str) ->
 
 
 def _waiting_for_request(message: str, match: dict[str, Any]) -> StepResult:
+    """Record the match outcome and ask the user which request they mean."""
     return StepResult(
         message,
         {"match_result": match, "pending_question": {"type": "which_request"}, "awaiting_user_input": True},
@@ -1416,7 +1458,14 @@ def account_exists(state: ContactUsChatState) -> bool:
 
 @tracked_step("validate_customer_data", "Validating the details", "Unable to validate the details.")
 async def validate_customer_data(state: ContactUsChatState, config: RunnableConfig) -> StepResult:
-    draft = customer_draft(state)
+    """Validate the conversion form; store the normalized details and what is missing or invalid.
+
+    `customer_payload` holds the normalized details that would be sent to BOOTOG.
+
+    Raises:
+        StepFailed: No request is selected.
+    """
+    draft =customer_draft(state)
     if draft is None:
         raise StepFailed("No Contact Us request is selected.")
     ctype = draft_type(state)
@@ -1437,7 +1486,8 @@ async def validate_customer_data(state: ContactUsChatState, config: RunnableConf
 
 
 async def ask_for_missing(state: ContactUsChatState, config: RunnableConfig) -> dict[str, Any]:
-    fields = (state.get("missing_required_fields") or []) + list(state.get("invalid_fields") or {})
+    """Ask for the missing and invalid fields; the turn ends waiting for the user."""
+    fields =(state.get("missing_required_fields") or []) + list(state.get("invalid_fields") or {})
     await _emitter(config).step("ask_for_missing", "waiting", f"Waiting for: {', '.join(fields)}")
     return {
         "pending_question": {"type": "missing_fields", "fields": fields},
@@ -1447,7 +1497,12 @@ async def ask_for_missing(state: ContactUsChatState, config: RunnableConfig) -> 
 
 
 async def respond(state: ContactUsChatState, config: RunnableConfig) -> dict[str, Any]:
-    emitter = _emitter(config)
+    """Last node of every turn: finish the bookkeeping and write the reply.
+
+    The reply LLM sees only structured facts (`build_facts`). When it fails or returns
+    nothing, a plain fallback reply is used. The reply is added to the conversation history.
+    """
+    emitter =_emitter(config)
     final = finalize_turn(state)
     merged: ContactUsChatState = {**state, **final}  # type: ignore[typeddict-item]
     facts = build_facts(merged)
@@ -1487,7 +1542,8 @@ def listed_this_turn(state: ContactUsChatState) -> bool:
 
 
 def conversion_finished(state: ContactUsChatState) -> bool:
-    ctype = active_type(state)
+    """True when every step of the conversion completed."""
+    ctype =active_type(state)
     conv = conversion_of(state)
     return bool(ctype) and set(conversion_steps(ctype, conv)) <= set(conv.get("completed") or [])
 
@@ -1561,7 +1617,8 @@ COMPANY_TYPE_LABEL = "Vendor Company Type"
 
 
 def provider_missing(state: ContactUsChatState) -> bool:
-    ctype = active_type(state)
+    """True when the conversion type needs a service provider and none is chosen yet."""
+    ctype =active_type(state)
     return bool(ctype and ctype.needs_target_provider and not conversion_of(state).get("target_provider"))
 
 
@@ -1599,6 +1656,7 @@ def conversion_state(state: ContactUsChatState, missing: list[str], invalid: dic
 
 
 def existing_account_warning(ctype_label: str) -> str:
+    """The warning shown when the email already has an account of this type."""
     return f"A {ctype_label} account already exists for this email. No duplicate account was created."
 
 
@@ -1758,7 +1816,13 @@ def customer_view(state: ContactUsChatState) -> dict[str, Any] | None:
 
 
 def _conversion_facts(state: ContactUsChatState) -> dict[str, Any] | None:
-    conv = conversion_of(state)
+    """What the reply LLM is told about the conversion: its steps, any block or failure
+    with how to continue, and the question it is waiting on.
+
+    Returns None when the conversion does not belong to the selected request (and is not
+    a standalone partner).
+    """
+    conv =conversion_of(state)
     unlinked = standalone(state)
     if not unlinked and (
         not conv.get("request_id") or conv.get("request_id") != (state.get("contact_request") or {}).get("id")
@@ -1917,11 +1981,16 @@ NEXT_ACTIONS = ("convert_another",)
 
 
 def _follow_up(state: ContactUsChatState) -> str:
-    noun = (state.get("agent_name") or "Contact Us Agent").removesuffix(" Agent")
+    """The question offered after a finished conversion."""
+    noun =(state.get("agent_name") or "Contact Us Agent").removesuffix(" Agent")
     return f"Would you like to convert another {noun} request?"
 
 
 def _failure_advice(failed: dict[str, Any]) -> str:
+    """What the reply should tell the user about a failed step and how to continue.
+
+    The checks are in priority order: the first one that applies wins.
+    """
     if failed.get("code") == "CSRF_INVALID":
         return (
             "Bootog's gateway refused the write (anti-forgery check). Nothing was created. An administrator "

@@ -5,6 +5,8 @@ ExecutionStatus = Literal["running", "completed", "blocked", "failed"]
 
 
 class ContactUsAgentState(TypedDict, total=False):
+    """State of the run workflow (graph.py). Every node returns a partial update of it."""
+
     run_id: str
     mode: RunMode
     provider_id: str | None
@@ -43,15 +45,25 @@ _HISTORY_LIMIT = 40
 
 
 class ChatMessage(TypedDict):
+    """One message of the conversation transcript."""
+
     role: Literal["user", "assistant"]
     content: str
 
 
 def append_history(existing: list[ChatMessage] | None, new: list[ChatMessage] | None) -> list[ChatMessage]:
+    """LangGraph reducer for `conversation_history`: append the new messages and keep the
+    last `_HISTORY_LIMIT` of them, so a node returns only the messages it adds."""
     return ((existing or []) + (new or []))[-_HISTORY_LIMIT:]
 
 
 class ContactUsChatState(ContactUsAgentState, total=False):
+    """State of one chat session (agent_graph.py): the run fields above plus the chat's own.
+
+    "Set per turn" fields are reset by `start_turn` at the beginning of every message;
+    "kept across turns" fields are the conversation's memory.
+    """
+
     session_id: str
     # Which Contact agent this session belongs to (Contact menu route segment) and the
     # GET /ContactUs module clause it works on. Fixed for the life of the session.

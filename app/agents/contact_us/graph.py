@@ -34,11 +34,21 @@ CUSTOMER_STEPS = list(STEPS)
 
 
 def plan_for(mode: RunMode) -> list[dict[str, str]]:
+    """The steps a run of this mode will go through, as shown in the Live Tracking plan.
+
+    Args:
+        mode: "create_customer" for the full workflow, "retrieve" for retrieval only.
+
+    Returns:
+        One {"id", "title", "description"} entry per step, in execution order.
+    """
     ids = CUSTOMER_STEPS if mode == "create_customer" else RETRIEVE_STEPS
     return [{"id": i, "title": STEPS[i][0], "description": STEPS[i][1]} for i in ids]
 
 
 def _continue_to(next_node: str) -> Callable[[ContactUsAgentState], str]:
+    """Build a router that goes to `next_node`, or ends the run once a step failed or was blocked."""
+
     def route(state: ContactUsAgentState) -> str:
         return END if state.get("execution_status") in ("failed", "blocked") else next_node
 
@@ -46,13 +56,15 @@ def _continue_to(next_node: str) -> Callable[[ContactUsAgentState], str]:
 
 
 def _after_retrieval(state: ContactUsAgentState) -> str:
+    """After retrieval: a retrieve run (or a failed one) ends; a customer run selects its request."""
     if state.get("execution_status") in ("failed", "blocked") or state.get("mode") != "create_customer":
         return END
     return "select_contact_request"
 
 
 def build_contact_us_graph():
-    graph = StateGraph(ContactUsAgentState)
+    """Build and compile the run workflow graph shown in the module docstring."""
+    graph =StateGraph(ContactUsAgentState)
     graph.add_node("initialize_run", nodes.initialize_run)
     graph.add_node("select_provider", nodes.select_provider)
     graph.add_node("get_contact_us_data", nodes.get_contact_us_data)
@@ -76,6 +88,7 @@ CONTACT_US_GRAPH = build_contact_us_graph()
 
 
 def _final_message(state: ContactUsAgentState, status: str) -> str:
+    """Message of the run's final event: the error for a failed/blocked run, else a summary."""
     if status in ("failed", "blocked"):
         return state.get("error") or "The Contact Us Agent stopped."
     if state.get("mode") == "create_customer":
@@ -84,7 +97,8 @@ def _final_message(state: ContactUsAgentState, status: str) -> str:
 
 
 def _result(state: ContactUsAgentState) -> dict[str, Any]:
-    selected = state.get("contact_request")
+    """The `result` payload of the run's final event (camelCase keys for the UI)."""
+    selected =state.get("contact_request")
     return {
         "mode": state.get("mode"),
         "providerId": state.get("provider_id"),
@@ -105,7 +119,21 @@ async def run_contact_us_agent(
     client: BootogClient,
     graph=None,
 ) -> ContactUsAgentState:
-    """Execute one run, streaming events into `channel`. Always closes the channel and client."""
+    """Execute one run, streaming events into `channel`. Always closes the channel and client.
+
+    The run mode comes from the request: with a `contact_request_id` it creates a
+    customer for that request, without one it only retrieves requests. A crash inside
+    the graph is logged and reported as a failed run, never as a success.
+
+    Args:
+        channel: Where the run's events are published.
+        request: Validated run request from the API.
+        client: BOOTOG client carrying the caller's auth.
+        graph: Graph to run instead of the default one (used by tests).
+
+    Returns:
+        The final state of the run.
+    """
     emitter = RunEmitter(channel)
     mode: RunMode = "create_customer" if request.contact_request_id else "retrieve"
     state: ContactUsAgentState = {

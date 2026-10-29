@@ -25,6 +25,14 @@ logger = get_logger(__name__)
 
 @dataclass
 class StepResult:
+    """What a tracked step returns when it succeeds.
+
+    Attributes:
+        message: Text of the step's "completed" event in the Live Tracking panel.
+        update: Fields merged into the graph state.
+        data: Optional extra details attached to the "completed" event.
+    """
+
     message: str
     update: dict[str, Any] = field(default_factory=dict)
     data: dict[str, Any] | None = None
@@ -52,6 +60,27 @@ NodeFn = Callable[[ContactUsAgentState, RunnableConfig], Awaitable[StepResult]]
 
 
 def tracked_step(step_id: str, running_message: str | Callable[[ContactUsAgentState], str], failure_message: str):
+    """Turn a step function into a graph node that reports its progress.
+
+    The node publishes a "running" event, runs the step, then publishes how it ended
+    and logs it. Outcomes:
+
+    - returns a StepResult -> "completed"; its `update` is applied to the state.
+    - raises StepBlocked / CustomerApiNotConfiguredError -> "blocked".
+    - raises StepFailed -> "failed" with the exception's message.
+    - raises BootogApiError -> "failed" with `failure_message` plus the API's message.
+    - raises anything else -> "failed" with `failure_message`; details go to the log only.
+
+    Blocked and failed outcomes set `execution_status` and `error` instead of raising,
+    so the graph's routing decides what happens next.
+
+    Args:
+        step_id: Step name used in events and logs.
+        running_message: Text of the "running" event, or a function that builds it
+            from the state.
+        failure_message: User-safe text used when the step fails unexpectedly.
+    """
+
     def decorator(fn: NodeFn):
         @functools.wraps(fn)
         async def node(state: ContactUsAgentState, config: RunnableConfig) -> dict[str, Any]:
@@ -90,6 +119,7 @@ def tracked_step(step_id: str, running_message: str | Callable[[ContactUsAgentSt
 
 
 async def _fail(emitter: RunEmitter, run_id: str, step_id: str, message: str, duration_ms: int) -> dict[str, Any]:
+    """Publish and log a "failed" step, and return the state update that marks the run failed."""
     await emitter.step(step_id, "failed", message, duration_ms=duration_ms)
     log_step(logger, AGENT, run_id, step_id, "failed", duration_ms)
     return {"current_step": step_id, "execution_status": "failed", "error": message}
@@ -100,6 +130,7 @@ async def _fail(emitter: RunEmitter, run_id: str, step_id: str, message: str, du
 
 @tracked_step("initialize_run", "Initializing Contact Us Agent", "Unable to start the Contact Us Agent.")
 async def initialize_run(state: ContactUsAgentState, config: RunnableConfig) -> StepResult:
+    """First step of a run: mark it running and record the start time."""
     if state["mode"] == "create_customer":
         message = "Agent started — customer creation for the selected request"
     else:
@@ -109,6 +140,15 @@ async def initialize_run(state: ContactUsAgentState, config: RunnableConfig) -> 
 
 @tracked_step("select_provider", "Applying company filter", "Unable to verify the selected company.")
 async def select_provider(state: ContactUsAgentState, config: RunnableConfig) -> StepResult:
+    """Check that the selected company is one the caller's session can use.
+
+    With no company selected, nothing is checked and the session's default access
+    applies. Otherwise the company must be in the session's provider list; its name is
+    then stored in `provider_name`.
+
+    Raises:
+        StepFailed: The selected company is not available to the session.
+    """
     provider_id = state.get("provider_id")
     if not provider_id:
         return StepResult("No company selected — using your session's default access")
@@ -131,6 +171,12 @@ def _request_noun(state: ContactUsAgentState) -> str:
     "Unable to retrieve Contact Us requests.",
 )
 async def get_contact_us_data(state: ContactUsAgentState, config: RunnableConfig) -> StepResult:
+    """Retrieve Contact Us requests with the filters in the state.
+
+    Shared by the run workflow and the chat agent. Stores the records in
+    `contact_requests`, the server's total in `contact_requests_total`, and whether a
+    search stopped at the page limit in `contact_requests_truncated`.
+    """
     # `request_filters` / `module_filter` are only set by the chat agent; the run workflow
     # never sets them, so it keeps the documented Contact-Us filter.
     filters = state.get("request_filters") or {}
@@ -171,6 +217,11 @@ async def get_contact_us_data(state: ContactUsAgentState, config: RunnableConfig
 
 @tracked_step("select_contact_request", "Reading the selected Contact Us request", "Unable to read the selected request.")
 async def select_contact_request(state: ContactUsAgentState, config: RunnableConfig) -> StepResult:
+    """Pick the record whose id is `contact_request_id` from the retrieved requests.
+
+    Raises:
+        StepFailed: That id is not among the retrieved requests.
+    """
     wanted = state.get("contact_request_id")
     record = next((r for r in state.get("contact_requests", []) if r.get("id") == wanted), None)
     if record is None:
@@ -185,6 +236,7 @@ async def select_contact_request(state: ContactUsAgentState, config: RunnableCon
 
 @tracked_step("prepare_customer_data", "Preparing customer information", "Unable to prepare customer information.")
 async def prepare_customer_data(state: ContactUsAgentState, config: RunnableConfig) -> StepResult:
+    """Map the selected request to a customer draft and list the required fields it lacks."""
     draft, missing = build_customer_draft(state["contact_request"])
     filled = sum(1 for v in draft.values() if v)
     message = f"Mapped {filled} customer field{'s' if filled != 1 else ''} from the request"
@@ -199,6 +251,11 @@ async def prepare_customer_data(state: ContactUsAgentState, config: RunnableConf
 
 @tracked_step("create_customer", "Creating customer account", "Customer creation failed.")
 async def create_customer_node(state: ContactUsAgentState, config: RunnableConfig) -> StepResult:
+    """Run-workflow customer creation through the `create_customer` tool.
+
+    Raises:
+        StepFailed: The API response has no customer id.
+    """
     result = await create_customer.ainvoke({"customer_payload": state["customer_payload"]}, config=config)
     customer_id = result.get("id") if isinstance(result, dict) else None
     if not customer_id:
@@ -208,6 +265,11 @@ async def create_customer_node(state: ContactUsAgentState, config: RunnableConfi
 
 @tracked_step("verify_customer", "Verifying customer", "Customer verification failed.")
 async def verify_customer(state: ContactUsAgentState, config: RunnableConfig) -> StepResult:
+    """Confirm that the creation response contains a customer id.
+
+    Raises:
+        StepFailed: There is no customer id to verify.
+    """
     # No customer-details API with documented parameters exists yet, so verification
     # is limited to the creation response itself.
     customer_id = (state.get("customer_result") or {}).get("id")

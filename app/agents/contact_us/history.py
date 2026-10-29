@@ -59,6 +59,19 @@ def record_turn(
     agent: str,
     message: str | None,
 ) -> asyncio.Task:
+    """Record one turn in the chat history in the background (see `_record_turn`).
+
+    Args:
+        turn: The running turn; the agent's reply is recorded once it finishes.
+        channel: The turn's event channel, read for the final `run` event.
+        session_id: Conversation the messages belong to.
+        owner: Fingerprint of the caller who owns the conversation.
+        agent: Canonical key of the Contact agent.
+        message: The user's message, or None for a turn started without one.
+
+    Returns:
+        The background task.
+    """
     return asyncio.create_task(_record_turn(turn, channel, session_id, owner, agent, message))
 
 
@@ -70,6 +83,11 @@ async def _record_turn(
     agent: str,
     message: str | None,
 ) -> None:
+    """Store the user's message, wait for the turn, then store the agent's reply.
+
+    The reply is taken from the last `run` event on the channel: its `result.reply`,
+    else its message. It is flagged as an error when the run failed.
+    """
     if message:
         await history_store.record_message(session_id, owner, agent, "user", message)
     try:

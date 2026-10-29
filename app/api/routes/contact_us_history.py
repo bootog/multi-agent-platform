@@ -29,7 +29,7 @@ _UNAVAILABLE = "Chat history is unavailable right now."
 def _owner(authorization: str | None) -> str:
     return owner_fingerprint(_auth(authorization, None, None, None).bearer_token)
 
-
+# Create a new conversation
 @router.post(
     "/contact-us/session",
     response_model=ChatSessionCreated,
@@ -43,7 +43,7 @@ async def create_chat_session(request: ChatSessionRequest, authorization: str | 
     created_at = await history_store.create_session(session_id, owner, agent)
     return ChatSessionCreated(session_id=session_id, created_at=created_at or datetime.now(timezone.utc))
 
-
+# List previous conversations
 @router.get("/contact-us/history", response_model=list[ChatHistorySession], response_model_by_alias=True)
 async def list_chat_history(
     agent_key: str | None = Query(None, alias="agentKey", pattern=AGENT_KEY_PATTERN),
@@ -56,7 +56,7 @@ async def list_chat_history(
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail=_UNAVAILABLE) from exc
     return [ChatHistorySession(**vars(s)) for s in found]
 
-
+# Retrieve one conversation and its messages
 @router.get("/contact-us/history/{session_id}", response_model=ChatHistoryDetail, response_model_by_alias=True)
 async def get_chat_history(
     session_id: str,
@@ -80,7 +80,7 @@ async def get_chat_history(
         ],
     )
 
-
+# Delete selected conversations and their messages
 @router.delete("/contact-us/history", response_model=DeleteHistoryResult, response_model_by_alias=True)
 async def delete_chat_history(request: DeleteHistoryRequest, authorization: str | None = Header(None)) -> DeleteHistoryResult:
     """Permanently deletes the selected conversations (by session_id) and their messages."""

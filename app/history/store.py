@@ -462,7 +462,7 @@ class AgentHistoryStore:
             return False
 
     # --- Reads and deletes for the history API (raise HistoryUnavailable) ---
-
+    # --- Lists the caller's conversations for a specific agent
     async def list_sessions(self, owner: str, agent: str, limit: int = 100) -> list[HistorySession]:
         pool = await self._require_pool()
         rows = await self._run(pool.fetch(self._list_sessions, owner, agent, limit))

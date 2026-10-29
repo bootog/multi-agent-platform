@@ -81,6 +81,7 @@ class ChatFormSubmission(CamelModel):
 
     @model_validator(mode="after")
     def _request_for_details(self) -> "ChatFormSubmission":
+        """Details and create forms always belong to a request, so they must name it."""
         if self.action in ("submit_details", "create") and not self.request_id:
             raise ValueError("request_id is required for this form")
         return self

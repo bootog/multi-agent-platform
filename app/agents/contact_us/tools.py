@@ -23,6 +23,7 @@ from app.integrations.bootog.contact_us import CRM_COMPLETED_STATUS
 
 
 def _client(config: RunnableConfig) -> BootogClient:
+    """The BOOTOG client of the current run, injected through the RunnableConfig."""
     return config["configurable"]["bootog_client"]
 
 
@@ -36,6 +37,7 @@ HISTORY_PAGE_SIZE = 200
 
 
 def list_page_size() -> int:
+    """Requests per chat list page: the configured page size, capped at LIST_PAGE_SIZE."""
     return max(1, min(get_settings().contact_us_page_size, LIST_PAGE_SIZE))
 
 

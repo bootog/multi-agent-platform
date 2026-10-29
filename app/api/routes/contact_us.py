@@ -80,7 +80,8 @@ async def send_contact_us_chat_message(
     session_id, restarted = canonical_session_id(request.session_id), False
     if session_id and sessions.owner_of(session_id) is None:
         # Not live (restart/expiry/reopened from history): continue it from chat history
-        # under the same id when it is this caller's conversation with this agent.
+        # under the same id whe
+        # n it is this caller's conversation with this agent.
         if not await restore_session(session_id, owner, agent):
             session_id, restarted = None, True
     if session_id is None:

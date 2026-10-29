@@ -43,7 +43,11 @@ _BLOCK_END = re.compile(r"</(p|div|li|h\d)>|<br\s*/?>", re.IGNORECASE)
 
 
 def status_value(name: str | None) -> int | None:
-    key = re.sub(r"[^a-z]", "", (name or "").casefold())
+    """ContactUsStatus value for a status name ("under review", "Re-Open", "cancel" ...).
+
+    Case, spaces and punctuation are ignored. Returns None when the name is not a status.
+    """
+    key =re.sub(r"[^a-z]", "", (name or "").casefold())
     if not key:
         return None
     for value, label in CONTACT_US_STATUS_LABELS.items():
@@ -65,6 +69,7 @@ def text_of(value: Any) -> str | None:
 
 
 def full_name(record: dict[str, Any] | None) -> str:
+    """"First Last" of a Contact Us record, or "Unnamed request" when it has no name."""
     return " ".join(p for p in ((record or {}).get("firstName"), (record or {}).get("lastName")) if p) or "Unnamed request"
 
 
@@ -83,7 +88,8 @@ def _history_target(state: ContactUsChatState) -> dict[str, Any] | None:
 
 
 def _entry(row: dict[str, Any]) -> dict[str, Any]:
-    status = row.get("contactUsStatus")
+    """One tracking-history row as the history card shows it (HTML comments as plain text)."""
+    status =row.get("contactUsStatus")
     return {
         "id": row.get("id"),
         "statusId": status if isinstance(status, int) else None,
@@ -106,7 +112,16 @@ def _entry(row: dict[str, Any]) -> dict[str, Any]:
 
 @tracked_step("get_tracking_history", "Reading the request history", "Unable to read the request history.")
 async def get_tracking_history(state: ContactUsChatState, config: RunnableConfig) -> StepResult:
-    target = _history_target(state)
+    """Read the tracking history of the target request into `history` (for the card).
+
+    The first `_HISTORY_SHOWN` entries are kept. When BOOTOG refuses, the step still
+    completes, with the error recorded in `history`, so the reply says the history could
+    not be loaded instead of claiming there is none.
+
+    Raises:
+        StepFailed: No request is selected.
+    """
+    target =_history_target(state)
     if not target:
         raise StepFailed("No request is selected to show the history of.")
     view: dict[str, Any] = {"requestId": target["id"], "name": target.get("name"), "entries": [], "total": 0}
@@ -137,12 +152,23 @@ def _targets(state: ContactUsChatState) -> list[dict[str, Any]]:
 
 
 def _settable_options() -> list[dict[str, Any]]:
+    """The statuses the user may choose, as {"id", "name"} options for the card."""
     return [{"id": k, "name": v} for k, v in SETTABLE_STATUSES.items()]
 
 
 @tracked_step("prepare_status_change", "Preparing the status change", "Unable to prepare the status change.")
 async def prepare_status_change(state: ContactUsChatState, config: RunnableConfig) -> StepResult:
-    ask = state.get("status_request") or {}
+    """Prepare a status change and ask the user to confirm it. Nothing is sent here.
+
+    The change is stored in `status_change` with a new token. Its `state` is
+    "confirming" when a settable status was named, else "choosing" (the card offers the
+    statuses). When every target request already has that status, there is nothing to
+    change and nothing is pending.
+
+    Raises:
+        StepFailed: No request is selected.
+    """
+    ask =state.get("status_request") or {}
     records = _targets(state)
     if not records:
         raise StepFailed("No request is selected to change the status of.")
@@ -179,7 +205,16 @@ async def prepare_status_change(state: ContactUsChatState, config: RunnableConfi
 
 @tracked_step("change_request_status", "Changing the request status", "Changing the status failed.")
 async def change_request_status(state: ContactUsChatState, config: RunnableConfig) -> StepResult:
-    change = dict(state.get("status_change") or {})
+    """Send the confirmed status change to BOOTOG, then read each request back to verify it.
+
+    The outcome is recorded in `status_change`: "done" (all verified), "partial", "failed",
+    or "unknown" (BOOTOG did not answer). Verified requests are updated in the
+    conversation's copies of the list and of the selected request.
+
+    Raises:
+        StepFailed: This turn did not confirm a pending change.
+    """
+    change =dict(state.get("status_change") or {})
     # Enforced here, not by the prompt: exactly the change that was shown, confirmed now, once.
     if not (state.get("status_change_confirmed") and change.get("state") == "confirming"
             and (change.get("status") or {}).get("id") in SETTABLE_STATUSES and change.get("ids")):
@@ -257,7 +292,11 @@ def status_change_view(state: ContactUsChatState) -> dict[str, Any] | None:
 
 
 def status_change_facts(state: ContactUsChatState) -> dict[str, Any] | None:
-    view = status_change_view(state)
+    """What the reply LLM is told about this turn's status change, with what to say next.
+
+    Returns None when this turn has no status change.
+    """
+    view =status_change_view(state)
     if not view:
         return None
     names = {r["id"]: r["name"] for r in view["requests"]}

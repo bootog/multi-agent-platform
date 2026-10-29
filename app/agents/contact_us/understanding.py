@@ -165,6 +165,7 @@ def _llm(config: RunnableConfig) -> BaseChatModel:
 
 
 def _history(messages: list[ChatMessage], limit: int) -> list[BaseMessage]:
+    """The last `limit` transcript messages as LangChain messages."""
     out: list[BaseMessage] = []
     for m in messages[-limit:]:
         out.append(HumanMessage(m["content"]) if m["role"] == "user" else AIMessage(m["content"]))
@@ -172,6 +173,7 @@ def _history(messages: list[ChatMessage], limit: int) -> list[BaseMessage]:
 
 
 def _json(data: Any) -> str:
+    """Readable JSON for a prompt; values JSON can't encode are written with str()."""
     return json.dumps(data, ensure_ascii=False, default=str, indent=1)
 
 
@@ -180,7 +182,17 @@ async def understand(
     history: list[ChatMessage],
     state_summary: dict[str, Any],
 ) -> TurnUnderstanding:
-    structured = _llm(config).with_structured_output(TurnUnderstanding)
+    """Ask the LLM what the user's latest message means.
+
+    Args:
+        config: The turn's config (an `llm` may be injected for tests).
+        history: The conversation so far; the last 12 messages are sent.
+        state_summary: What the agent currently knows (see agent_nodes._state_summary).
+
+    Returns:
+        The typed interpretation of the message.
+    """
+    structured =_llm(config).with_structured_output(TurnUnderstanding)
     messages: list[BaseMessage] = [
         SystemMessage(UNDERSTAND_SYSTEM_PROMPT),
         SystemMessage(f"Current agent state (today is {date.today().isoformat()}):\n{_json(state_summary)}"),
@@ -193,7 +205,17 @@ async def understand(
 
 
 async def compose_reply(config: RunnableConfig, history: list[ChatMessage], facts: dict[str, Any]) -> str:
-    messages: list[BaseMessage] = [
+    """Ask the LLM to write the reply to the user from this turn's facts.
+
+    Args:
+        config: The turn's config (an `llm` may be injected for tests).
+        history: The conversation so far; the last 12 messages are sent.
+        facts: Structured results of the turn (see agent_nodes.build_facts).
+
+    Returns:
+        The reply text, stripped; empty when the model returned no text.
+    """
+    messages:list[BaseMessage] = [
         SystemMessage(RESPOND_SYSTEM_PROMPT),
         *_history(history, 12),
         SystemMessage(f"Facts for this turn:\n{_json(facts)}"),

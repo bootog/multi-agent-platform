@@ -36,6 +36,9 @@ from typing import Any
 
 @dataclass(frozen=True)
 class FieldSpec:
+    """One field of the conversion forms: its key, label, where it is prefilled from and
+    how it is validated (`kind`)."""
+
     key: str
     label: str
     source: str | None  # Contact Us record field it is prefilled from
@@ -83,6 +86,8 @@ COMPANY_FORM = ("companyName", *_PERSON, "website", "companyBio", "yearsInBusine
 
 @dataclass(frozen=True)
 class ConversionType:
+    """One kind of account a request can be converted into, and how BOOTOG creates it."""
+
     key: str
     label: str
     operation: str  # chat `operation` while this conversion is in progress
@@ -159,16 +164,13 @@ STEP_LABELS: dict[str, str] = {
 
 
 def conversion_type(key: str | None) -> ConversionType | None:
+    """The conversion type with this key, or None (also for the PARTNER_FORM placeholder)."""
     return CONVERSION_TYPES.get(key or "")
 
 
 def partner_type_name(ctype: ConversionType) -> str:
     """"Contractor" for "Partner — Contractor": the company type as the partner screen names it."""
     return ctype.label.removeprefix("Partner — ")
-
-
-def all_field_keys() -> list[str]:
-    return list(FIELD_SPECS)
 
 
 # --- draft and validation ------------------------------------------------------------
@@ -189,6 +191,7 @@ _PLACEHOLDER = re.compile(
 
 
 def is_placeholder(value: Any) -> bool:
+    """True for text that stands in for a missing value ("N/A", "tbd", "needs verification")."""
     return isinstance(value, str) and bool(_PLACEHOLDER.match(" ".join(value.split())))
 
 
@@ -218,7 +221,14 @@ def build_draft(ctype: ConversionType, record: dict[str, Any], user_values: dict
 def validate_draft(
     ctype: ConversionType, draft: dict[str, str | None]
 ) -> tuple[dict[str, str | None], list[str], dict[str, str]]:
-    """-> (normalized draft, missing required labels, {label: why invalid})."""
+    """Check a draft the way the host app's forms do, and normalize what it can.
+
+    Normalized values: phone -> (xxx) xxx-xxxx, money -> plain number, US country
+    spellings -> "US", and for a US address the state name -> its 2-letter code.
+
+    Returns:
+        (normalized draft, labels of missing required fields, {label: why it is invalid}).
+    """
     normalized = dict(draft)
     missing = [FIELD_LABELS[k] for k in ctype.fields if k in ctype.required and not draft.get(k)]
     invalid: dict[str, str] = {}
@@ -326,6 +336,7 @@ def format_phone(value: str) -> str | None:
 
 
 def _number(value: str | None) -> float | None:
+    """The value as a float, or None when it is not a number."""
     try:
         return float(str(value).strip())
     except (TypeError, ValueError):
@@ -391,6 +402,8 @@ def build_vendor_user_form(
 
 @dataclass(frozen=True)
 class UploadSpec:
+    """An image the partner form accepts, and the multipart name it is sent under."""
+
     key: str
     label: str
     form_name: str  # AddVendorUser multipart prefix

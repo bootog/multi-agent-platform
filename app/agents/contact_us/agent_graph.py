@@ -114,8 +114,14 @@ def _recorded(name: str, fn: NodeFn) -> NodeFn:
 
 
 def next_step(state: ContactUsChatState) -> str:
+    """The chat graph's router: which node runs next in this turn.
+
+    Runs after every node. It decides from the LLM's interpretation (`intent`) and the
+    structured state, and checks whether a node already ran this turn so no node loops.
+    Returns a node name, or "respond" to end the turn with a reply.
+    """
     done = state.get("turn_steps") or []
-    ran = done.count
+    ran = done.count  # ran("x") = how many times node "x" already ran in this turn
     if state.get("execution_status") in ("failed", "blocked"):
         return "respond"
     if state.get("kickoff"):  # "Run Agent": load the latest requests and greet
@@ -209,6 +215,12 @@ def next_step(state: ContactUsChatState) -> str:
 
 
 def _conversion_step(state: ContactUsChatState, ran: Callable[[str], int]) -> str:
+    """The next node of a conversion the user is working on this turn.
+
+    Order: set up the conversion -> its type -> provider -> validate the details -> role
+    -> existing-account check -> sub-categories (Contractor) -> confirmation -> creation.
+    Once the account exists, only the remaining steps after creation are resumed.
+    """
     if not ran("start_conversion"):
         return "start_conversion"
     conv = conversion_of(state)
@@ -341,12 +353,20 @@ def _creation_authorized(state: ContactUsChatState, conv: dict[str, Any], finger
 
 
 def _unmerged(state: ContactUsChatState, ran: Callable[[str], int]) -> bool:
+    """True when this turn brought details or notes that merge_customer_fields hasn't stored yet."""
     has_updates = state.get("turn_field_updates") or state.get("turn_extra_information")
     return bool(has_updates) and not ran("merge_customer_fields")
 
 
 def build_contact_us_chat_graph(checkpointer=None):
-    graph = StateGraph(ContactUsChatState)
+    """Build and compile the chat graph: start_turn, every node in NODES, and respond.
+
+    Every node except respond is followed by `next_step`, which picks the next node.
+
+    Args:
+        checkpointer: Saves each session's state between turns (None: no saving).
+    """
+    graph =StateGraph(ContactUsChatState)
     graph.add_node("start_turn", agent_nodes.start_turn)
     for name, fn in NODES.items():
         graph.add_node(name, _recorded(name, fn))
@@ -381,6 +401,7 @@ class ChatSessions:
         self._busy: set[str] = set()
 
     async def create(self, owner: str, agent: str) -> str:
+        """Register a new session for this owner and agent; returns its id."""
         await self._prune()
         session_id = uuid.uuid4().hex
         self._owners[session_id] = owner
@@ -396,6 +417,7 @@ class ChatSessions:
         self._last_used[session_id] = time.monotonic()
 
     def owner_of(self, session_id: str) -> str | None:
+        """Fingerprint of the session's owner, or None for an unknown session."""
         return self._owners.get(session_id)
 
     def agent_of(self, session_id: str) -> str | None:
@@ -403,6 +425,7 @@ class ChatSessions:
         return self._agents.get(session_id)
 
     def begin(self, session_id: str) -> bool:
+        """Mark a turn as running. False when the session is already running one."""
         if session_id in self._busy:
             return False
         self._busy.add(session_id)
@@ -410,16 +433,21 @@ class ChatSessions:
         return True
 
     def end(self, session_id: str) -> None:
+        """Mark the session's turn as finished."""
         self._busy.discard(session_id)
         self._last_used[session_id] = time.monotonic()
 
     async def delete(self, session_id: str) -> None:
+        """Forget the session and delete its saved graph state."""
         self._owners.pop(session_id, None)
         self._agents.pop(session_id, None)
         self._last_used.pop(session_id, None)
         await self._checkpointer.adelete_thread(session_id)
 
     async def _prune(self) -> None:
+        """Delete idle sessions (unused longer than the TTL), then the least recently used
+        ones if needed so that one more session fits under `max_sessions`. Sessions
+        running a turn are never deleted."""
         now = time.monotonic()
         idle = [s for s, t in self._last_used.items() if s not in self._busy and now - t > self._ttl]
         oldest = sorted((t, s) for s, t in self._last_used.items() if s not in self._busy and s not in idle)
@@ -566,6 +594,7 @@ async def run_turn_in_session(
     form: dict[str, Any] | None = None,
     viewer_user_id: str | None = None,
 ) -> None:
+    """Run one turn, then always release the session for the next turn."""
     try:
         await run_contact_us_chat_turn(
             channel, session_id, message, client, agent_key=agent_key, agent_label=agent_label, form=form,
@@ -585,6 +614,7 @@ def start_turn_task(
     form: dict[str, Any] | None = None,
     viewer_user_id: str | None = None,
 ) -> asyncio.Task:
+    """Start `run_turn_in_session` in the background, so the API can answer right away."""
     return asyncio.create_task(
         run_turn_in_session(channel, session_id, message, client, agent_key, agent_label, form, viewer_user_id)
     )
