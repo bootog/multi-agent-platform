@@ -253,6 +253,10 @@ initialize_run → select_provider → get_contact_us_data ─┬─ (no request
 
 A failed or blocked step ends the run. Later steps never run.
 
+This is a separate graph from the chat agent's (`graph.py` vs `agent_graph.py`). A run goes
+from start to end in one call and keeps no memory. A chat session is checkpointed per
+`thread_id` and pauses between messages. Both run the same step functions from `nodes.py`.
+
 | Endpoint | |
 |---|---|
 | `GET /api/v1/agents/contact-us/providers` | Companies for the session's company filter |

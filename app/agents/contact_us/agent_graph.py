@@ -23,7 +23,12 @@ from the user; the next message continues from the same saved state.
 
 `next_step` runs after every node and decides where to go from the LLM's
 interpretation plus the structured state. The LLM never chooses an API call, and
-nothing is created without a confirmation of exactly the data that is sent."""
+nothing is created without a confirmation of exactly the data that is sent.
+
+This is a separate graph from the one-shot run workflow (graph.py, POST /contact-us/runs)
+because it is checkpointed: CHECKPOINTER saves the state under the session's thread_id
+after every turn, and the next message continues from it. The run workflow has no memory
+and needs none. Both graphs run the same step functions from nodes.py."""
 
 import asyncio
 from collections.abc import Awaitable, Callable

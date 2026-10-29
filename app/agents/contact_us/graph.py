@@ -1,10 +1,23 @@
-"""Contact Us Agent — LangGraph workflow.
+"""Contact Us Agent — one-shot run workflow (POST /contact-us/runs).
 
 START -> initialize_run -> select_provider -> get_contact_us_data
       -> (retrieve mode: END)
       -> select_contact_request -> prepare_customer_data -> create_customer -> verify_customer -> END
 
-Any failed/blocked step ends the run; later steps never execute."""
+Any failed/blocked step ends the run; later steps never execute. `create_customer` is
+always blocked (CustomerApi.create): customers are created in the chat agent instead.
+
+Why this is not part of the chat graph (agent_graph.py):
+- This graph runs once per request, from start to END, with no memory: it is compiled
+  without a checkpointer, so a run needs no thread_id and leaves nothing behind.
+- The chat graph is checkpointed (one saved thread per chat session), uses an LLM, and
+  pauses between messages to ask questions or wait for a "yes".
+- Both graphs run the same step functions from nodes.py (get_contact_us_data,
+  select_contact_request, prepare_customer_data), so the BOOTOG calls are not duplicated.
+
+LangGraph terms used here: a node is an async function that gets the state and returns
+the fields to change; a conditional edge is a function that looks at the state and
+returns the name of the next node (or END)."""
 
 from collections.abc import Callable
 from typing import Any
@@ -31,6 +44,15 @@ STEPS: dict[str, tuple[str, str]] = {
 }
 RETRIEVE_STEPS = ["initialize_run", "select_provider", "get_contact_us_data"]
 CUSTOMER_STEPS = list(STEPS)
+
+
+def run_mode(request: ContactUsRunRequest) -> RunMode:
+    """The mode of a run: a selected request means "create_customer", none means "retrieve".
+
+    Used by both the API (for the plan it returns) and the run itself (for the plan it
+    streams), so the two always agree.
+    """
+    return "create_customer" if request.contact_request_id else "retrieve"
 
 
 def plan_for(mode: RunMode) -> list[dict[str, str]]:
@@ -135,7 +157,7 @@ async def run_contact_us_agent(
         The final state of the run.
     """
     emitter = RunEmitter(channel)
-    mode: RunMode = "create_customer" if request.contact_request_id else "retrieve"
+    mode = run_mode(request)
     state: ContactUsAgentState = {
         "run_id": channel.run_id,
         "mode": mode,

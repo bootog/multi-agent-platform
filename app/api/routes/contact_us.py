@@ -4,7 +4,7 @@ import json
 from fastapi import APIRouter, Header, HTTPException, Response, status
 from fastapi.responses import StreamingResponse
 
-from app.agents.contact_us import plan_for, run_contact_us_agent
+from app.agents.contact_us import plan_for, run_contact_us_agent, run_mode
 from app.agents.contact_us.agent_graph import owner_fingerprint, sessions, start_turn_task
 from app.agents.contact_us.history import canonical_session_id, record_turn, restore_session
 from app.agents.contact_us.modules import canonical_agent_key
@@ -54,7 +54,7 @@ async def start_contact_us_run(
     channel = registry.create("contact-us")
     client = BootogClient(_auth(authorization, x_tenant_id, x_role_id, x_device_id))
     registry.track(asyncio.create_task(run_contact_us_agent(channel, request, client)))
-    mode = "create_customer" if request.contact_request_id else "retrieve"
+    mode = run_mode(request)
     return RunStarted(run_id=channel.run_id, mode=mode, steps=plan_for(mode))
 
 
